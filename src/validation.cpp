@@ -46,6 +46,7 @@
 #include <tinyformat.h>
 #include <txdb.h>
 #include <txmempool.h>
+#include <udpapi.h>
 #include <uint256.h>
 #include <undo.h>
 #include <util/byte_units.h>
@@ -4370,6 +4371,12 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         }
         LogError("%s: %s\n", __func__, state.ToString());
         return false;
+    }
+
+    // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
+    // (but if it does not build on our best tip, let the SendMessages loop relay it)
+    if (!IsInitialBlockDownload() && fHasMoreOrSameWork) {
+        UDPRelayBlock(block); // TODO: Do this via NewPoWValidBlock!
     }
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW

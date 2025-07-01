@@ -60,6 +60,10 @@ add_dependencies(bitcoin_clientversion generate_build_info)
 
 add_subdirectory(crypto)
 add_subdirectory(util)
+add_subdirectory(fec)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(libevent_core REQUIRED IMPORTED_TARGET GLOBAL libevent_core>=2.1.8)
+pkg_check_modules(libevent_pthreads REQUIRED IMPORTED_TARGET GLOBAL libevent_pthreads>=2.1.8)
 if(ENABLE_IPC)
   add_subdirectory(ipc)
 else()
@@ -191,6 +195,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   consensus/tx_verify.cpp
   dbwrapper.cpp
   deploymentstatus.cpp
+  fec.cpp
   flatfile.cpp
   headerssync.cpp
   httprpc.cpp
@@ -244,6 +249,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txreconciliation.cpp
   node/utxo_snapshot.cpp
   node/warnings.cpp
+  open_hash_set.h
   noui.cpp
   policy/ephemeral_policy.cpp
   policy/fees/block_policy_estimator.cpp
@@ -267,6 +273,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/server_util.cpp
   rpc/signmessage.cpp
   rpc/txoutproof.cpp
+  rpc/udpnet.cpp
   script/sigcache.cpp
   signet.cpp
   torcontrol.cpp
@@ -274,6 +281,8 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   txgraph.cpp
   txmempool.cpp
   txrequest.cpp
+  udpnet.cpp
+  udprelay.cpp
   validation.cpp
   validationinterface.cpp
   versionbits.cpp
@@ -288,6 +297,8 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>
     leveldb
     minisketch
+    PkgConfig::libevent_core
+    PkgConfig::libevent_pthreads
     univalue
     $<TARGET_NAME_IF_EXISTS:Boost::headers>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
@@ -321,6 +332,7 @@ if(BUILD_DAEMON)
     core_interface
     bitcoin_node
     $<TARGET_NAME_IF_EXISTS:bitcoin_wallet>
+    bitcoin_fec
   )
   install_binary_component(bitcoind HAS_MANPAGE)
 endif()
@@ -334,6 +346,7 @@ if(ENABLE_IPC AND BUILD_DAEMON)
     bitcoin_node
     bitcoin_ipc
     $<TARGET_NAME_IF_EXISTS:bitcoin_wallet>
+    bitcoin_fec
   )
   install_binary_component(bitcoin-node INTERNAL)
 endif()

@@ -299,6 +299,8 @@ private:
     const Txid hash;
     const Wtxid m_witness_hash;
 
+    // mutable std::vector<unsigned char> encodedForm;
+
     Txid ComputeHash() const;
     Wtxid ComputeWitnessHash() const;
 
