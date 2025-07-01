@@ -180,6 +180,9 @@ if(ENABLE_WALLET)
 endif()
 
 
+# FEC is a node dependency, including node consumers built without the daemon.
+add_subdirectory(fec)
+
 # P2P and RPC server functionality used by `bitcoind` and `bitcoin-qt` executables.
 add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   addrdb.cpp
@@ -285,6 +288,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
 target_link_libraries(bitcoin_node
   PRIVATE
     core_interface
+    bitcoin_fec
     bitcoin_common
     bitcoin_util
     $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>
