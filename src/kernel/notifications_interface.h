@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <variant>
 
+class CBlock;
 class CBlockIndex;
 enum class SynchronizationState;
 struct bilingual_str;
@@ -38,6 +39,12 @@ public:
     virtual ~Notifications() = default;
 
     [[nodiscard]] virtual InterruptResult blockTip(SynchronizationState state, const CBlockIndex& index, double verification_progress) { return {}; }
+    //! Synchronous notification under cs_main after block/context checks, before
+    //! NewPoWValidBlock and disk storage; full script connection has not run.
+    //! References are valid during this call.
+    //! Optional so standalone kernel clients need no networking implementation.
+    virtual void blockAccepted(const CBlock& block, const CBlockIndex& index) {}
+
     virtual void headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync) {}
     virtual void progress(const bilingual_str& title, int progress_percent, bool resume_possible) {}
     virtual void warningSet(Warning id, const bilingual_str& message) {}
