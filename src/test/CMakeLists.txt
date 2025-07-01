@@ -168,6 +168,7 @@ target_link_libraries(test_bitcoin
   Boost::headers
   libevent::extra
   $<TARGET_NAME_IF_EXISTS:USDT::headers>
+  bitcoin_fec
 )
 
 if(ENABLE_WALLET)
