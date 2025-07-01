@@ -159,6 +159,7 @@ target_link_libraries(test_bitcoin
   secp256k1
   Boost::headers
   libevent::extra
+  bitcoin_fec
 )
 
 if(ENABLE_WALLET)
