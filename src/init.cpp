@@ -83,6 +83,7 @@
 #include <torcontrol.h>
 #include <txgraph.h>
 #include <txmempool.h>
+#include <udpapi.h>
 #include <uint256.h>
 #include <util/asmap.h>
 #include <util/batchpriority.h>
@@ -346,6 +347,9 @@ void Shutdown(NodeContext& node)
     }
 
     if (node.background_init_thread.joinable()) node.background_init_thread.join();
+
+    // Join UDP users before destroying peer management or chainstate.
+    StopUDPConnections();
     // After everything has been shut down, but before things get flushed, stop the
     // the scheduler. After this point, SyncWithValidationInterfaceQueue() should not be called anymore
     // as this would prevent the shutdown from completing.
@@ -565,6 +569,9 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                 ), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bantime=<n>", strprintf("Default duration (in seconds) of manually configured bans (default: %u)", DEFAULT_MISBEHAVING_BANTIME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bind=<addr>[:<port>][=onion]", strprintf("Bind to given address and always listen on it (default: 0.0.0.0). Use [host]:port notation for IPv6. Append =onion to tag any incoming connections to that address and port as incoming Tor connections (default: 127.0.0.1:%u=onion, testnet3: 127.0.0.1:%u=onion, testnet4: 127.0.0.1:%u=onion, signet: 127.0.0.1:%u=onion, regtest: 127.0.0.1:%u=onion)", defaultChainParams->GetDefaultPort() + 1, testnetChainParams->GetDefaultPort() + 1, testnet4ChainParams->GetDefaultPort() + 1, signetChainParams->GetDefaultPort() + 1, regtestChainParams->GetDefaultPort() + 1), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-addudpnode=<ip/host>:<port>,<local_magic>,<remote_magic>[,<group>]", "Add a persistent UDP node, see RPC addudpnode for detailed description", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY | ArgsManager::SENSITIVE, OptionsCategory::CONNECTION);
+    argsman.AddArg("-addtrustedudpnode=<ip/host>:<port>,<local_magic>,<remote_magic>[,<group>]", "Add a trusted, persistent UDP node, see RPC addudpnode for detailed description", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY | ArgsManager::SENSITIVE, OptionsCategory::CONNECTION);
+    argsman.AddArg("-udpport=<port>,<group>[,<bw>]", "Accepts UDP connections on <port> (default: bw=1024 =1024Mbps)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-cjdnsreachable", "If set, then this host is configured for CJDNS (connecting to fc00::/8 addresses would lead us to the CJDNS network, see doc/cjdns.md) (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the same as for -addnode). This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-discover", "Discover own IP addresses (default: 1 when listening and no -externalip or -proxy)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -2390,6 +2397,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     if (!node.connman->Start(scheduler, connOptions)) {
         return false;
+    }
+
+    // Chainstate and peer management are ready; RPC remains in warmup.
+    if (!InitializeUDPConnections(&node)) {
+        return InitError(_("Failed to initialize FIBRE UDP ports or workers. Check the UDP configuration and debug log."));
     }
 
     // ********************************************************* Step 13: finished

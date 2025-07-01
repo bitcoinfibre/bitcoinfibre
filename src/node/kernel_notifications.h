@@ -48,6 +48,8 @@ public:
 
     [[nodiscard]] kernel::InterruptResult blockTip(SynchronizationState state, const CBlockIndex& index, double verification_progress) override EXCLUSIVE_LOCKS_REQUIRED(!m_tip_block_mutex);
 
+    void blockAccepted(const CBlock& block, const CBlockIndex& index) override;
+
     void headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync) override;
 
     void progress(const bilingual_str& title, int progress_percent, bool resume_possible) override;

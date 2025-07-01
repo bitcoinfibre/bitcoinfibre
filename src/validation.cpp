@@ -4364,6 +4364,12 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         return false;
     }
 
+    // Start FIBRE relay before NewPoWValidBlock: its synchronous subscribers
+    // construct and announce compact blocks, which must not delay UDP relay.
+    if (!IsInitialBlockDownload() && fHasMoreOrSameWork) {
+        GetNotifications().blockAccepted(block, *pindex);
+    }
+
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
     // (but if it does not build on our best tip, let the SendMessages loop relay it)
     if (!IsInitialBlockDownload() && ActiveTip() == pindex->pprev && m_options.signals) {
