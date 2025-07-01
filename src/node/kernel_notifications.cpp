@@ -14,6 +14,7 @@
 #include <node/abort.h>
 #include <node/interface_ui.h>
 #include <node/warnings.h>
+#include <udpapi.h>
 #include <util/check.h>
 #include <util/log.h>
 #include <util/signalinterrupt.h>
@@ -66,6 +67,12 @@ kernel::InterruptResult KernelNotifications::blockTip(SynchronizationState state
     }
     return {};
 }
+
+void KernelNotifications::blockAccepted(const CBlock& block, const CBlockIndex&)
+{
+    UDPRelayBlock(block);
+}
+
 
 void KernelNotifications::headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync)
 {
