@@ -25,6 +25,9 @@ EXPECTED_CIRCULAR_DEPENDENCIES = (
 
     # Temporary, removed in followup https://github.com/bitcoin/bitcoin/pull/24230
     "index/base -> node/context -> net_processing -> index/blockfilterindex -> index/base",
+
+    # FIBRE: the UDP transport and block relay call into each other.
+    "udpnet -> udprelay -> udpnet",
 )
 
 CODE_DIR = "src"
