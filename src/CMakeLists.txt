@@ -274,6 +274,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/server_util.cpp
   rpc/signmessage.cpp
   rpc/txoutproof.cpp
+  rpc/udpnet.cpp
   script/sigcache.cpp
   signet.cpp
   torcontrol.cpp
