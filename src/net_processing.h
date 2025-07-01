@@ -22,12 +22,14 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 class AddrMan;
 class CTxMemPool;
 class ChainstateManager;
 class BanMan;
+class CBlockHeader;
 class CBlockIndex;
 class CScheduler;
 class DataStream;
@@ -134,6 +136,12 @@ public:
 
     /** Get peer manager info. */
     virtual PeerManagerInfo GetInfo() const = 0;
+
+    /** Get reference to extra transactions for compact block reconstruction (thread-safe for UDP). */
+    virtual std::shared_ptr<const std::vector<std::pair<Wtxid, CTransactionRef>>> GetExtraTxnForCompact() = 0;
+
+    /** Apply the current P2P claimed-work threshold before admitting a new FIBRE header. */
+    virtual bool CheckFibreBlockWork(const CBlockHeader& block) = 0;
 
     /** Get info about transactions currently being privately broadcast. */
     virtual std::vector<PrivateBroadcast::TxBroadcastInfo> GetPrivateBroadcastInfo() const = 0;
