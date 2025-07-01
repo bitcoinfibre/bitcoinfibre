@@ -83,6 +83,7 @@
 #include <torcontrol.h>
 #include <txgraph.h>
 #include <txmempool.h>
+#include <udpapi.h>
 #include <uint256.h>
 #include <util/asmap.h>
 #include <util/batchpriority.h>
@@ -346,6 +347,9 @@ void Shutdown(NodeContext& node)
     }
 
     if (node.background_init_thread.joinable()) node.background_init_thread.join();
+
+    // Join UDP users before destroying peer management or chainstate.
+    StopUDPConnections();
     // After everything has been shut down, but before things get flushed, stop the
     // the scheduler. After this point, SyncWithValidationInterfaceQueue() should not be called anymore
     // as this would prevent the shutdown from completing.
@@ -2393,6 +2397,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     if (!node.connman->Start(scheduler, connOptions)) {
         return false;
+    }
+
+    // Chainstate and peer management are ready; RPC remains in warmup.
+    if (!InitializeUDPConnections(&node)) {
+        return InitError(_("Failed to initialize FIBRE UDP ports or workers. Check the UDP configuration and debug log."));
     }
 
     // ********************************************************* Step 13: finished
