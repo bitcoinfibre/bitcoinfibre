@@ -95,6 +95,8 @@ namespace BCLog {
         SCAN        = (CategoryMask{1} << 27),
         TXPACKAGES  = (CategoryMask{1} << 28),
         KERNEL      = (CategoryMask{1} << 29),
+        UDPNET      = (1 << 30),
+        FEC         = (1 << 31),
         ALL         = ~NONE,
     };
     enum class Level {

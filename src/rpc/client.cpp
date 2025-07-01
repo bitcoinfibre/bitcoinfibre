@@ -386,6 +386,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "signmessagewithprivkey", 1, "message", ParamFormat::STRING },
     { "walletpassphrasechange", 0, "oldpassphrase", ParamFormat::STRING },
     { "walletpassphrasechange", 1, "newpassphrase", ParamFormat::STRING },
+    { "addudpnode", 3, "ultimately_trusted" },
+    { "addudpnode", 5, "group" },
 };
 // clang-format on
 

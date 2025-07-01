@@ -355,6 +355,88 @@ public:
     }
 };
 
+/** Write-only stream for serialization into a vector */
+/** Write-only stream for serialization into a vector */
+class VectorOutputStream
+{
+private:
+    std::vector<unsigned char>* v;
+
+    size_t nPos;
+
+    inline void resize_v(size_t nCount)
+    {
+        v->resize(std::max(v->size(), nPos + nCount));
+    }
+
+public:
+    VectorOutputStream(std::vector<unsigned char>* vIn, ssize_t nPosIn = -1) : v(vIn)
+    {
+        nPos = nPosIn == -1 ? v->size() : nPosIn;
+    }
+
+    template <typename T>
+    VectorOutputStream& operator<<(const T& obj)
+    {
+        ::Serialize(*this, obj);
+        return *this;
+    }
+
+    VectorOutputStream& write(std::span<const std::byte> src)
+    {
+        resize_v(src.size());
+        memcpy(&(*v)[nPos], src.data(), src.size());
+        nPos += src.size();
+        return *this;
+    }
+
+    void skip_bytes(size_t nCount)
+    {
+        resize_v(nCount);
+        nPos += nCount;
+    }
+
+    size_t pos() const { return nPos; }
+};
+
+/** Read-only stream for serialization from a vector */
+class VectorInputStream
+{
+private:
+    const std::vector<unsigned char>* v;
+
+    size_t nReadPos;
+
+public:
+    VectorInputStream(const std::vector<unsigned char>* vIn) : v(vIn), nReadPos(0) {}
+
+    template <typename T>
+    VectorInputStream& operator>>(T&& obj)
+    {
+        ::Unserialize(*this, obj);
+        return *this;
+    }
+
+    VectorInputStream& read(std::span<std::byte> dst)
+    {
+        // Read from the beginning of the buffer
+        unsigned int nReadPosNext = nReadPos + dst.size();
+        if (nReadPosNext > v->size())
+            throw std::ios_base::failure("CVectorStream::read(): end of data");
+        memcpy(dst.data(), &(*v)[nReadPos], dst.size());
+        nReadPos = nReadPosNext;
+        return (*this);
+    }
+
+    void seek(size_t nReadPosIn)
+    {
+        assert(nReadPosIn < v->size());
+        nReadPos = nReadPosIn;
+    }
+
+    size_t pos() const { return nReadPos; }
+};
+
 /** Non-refcounted RAII wrapper for FILE*
  *
  * Will automatically close the file when it goes out of scope if not null.

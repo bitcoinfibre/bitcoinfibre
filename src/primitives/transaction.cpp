@@ -11,6 +11,7 @@
 #include <primitives/transaction_identifier.h>
 #include <script/script.h>
 #include <serialize.h>
+#include <streams.h>
 #include <tinyformat.h>
 #include <uint256.h>
 
@@ -94,6 +95,12 @@ Wtxid CTransaction::ComputeWitnessHash() const
 
 CTransaction::CTransaction(const CMutableTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
 CTransaction::CTransaction(CMutableTransaction&& tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), version{tx.version}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
+/* CTransaction::CTransaction(CMutableTransaction&& tx, bool cache) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), version{tx.version}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {
+    if (cache) {
+        VectorOutputStream stream(&encodedForm);
+        Serialize(stream);
+    }
+} */
 
 CAmount CTransaction::GetValueOut() const
 {
