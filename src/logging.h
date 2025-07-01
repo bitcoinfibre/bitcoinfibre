@@ -94,6 +94,8 @@ namespace BCLog {
         TXRECONCILIATION = (CategoryMask{1} << 26),
         SCAN        = (CategoryMask{1} << 27),
         TXPACKAGES  = (CategoryMask{1} << 28),
+        UDPNET      = (1 << 29),
+        FEC         = (1 << 30),
         ALL         = ~NONE,
     };
     enum class Level {

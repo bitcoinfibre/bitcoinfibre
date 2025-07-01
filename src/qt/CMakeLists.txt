@@ -146,6 +146,7 @@ target_link_libraries(bitcoinqt
     $<TARGET_NAME_IF_EXISTS:QRencode::QRencode>
     $<$<PLATFORM_ID:Darwin>:-framework\ AppKit>
     $<$<CXX_COMPILER_ID:MSVC>:shlwapi>
+    bitcoin_fec
 )
 
 if(ENABLE_WALLET)

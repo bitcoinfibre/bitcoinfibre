@@ -314,6 +314,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "stop", 0, "wait" },
     { "addnode", 2, "v2transport" },
     { "addconnection", 2, "v2transport" },
+    { "addudpnode", 3, "ultimately_trusted" },
+    { "addudpnode", 5, "group" },
 };
 // clang-format on
 
