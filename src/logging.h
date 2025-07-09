@@ -299,4 +299,6 @@ static inline bool LogAcceptCategory(BCLog::LogFlags category, BCLog::Level leve
 /** Return true if str parses as a log category and set the flag */
 bool GetLogCategory(BCLog::LogFlags& flag, std::string_view str);
 
+void StopDebugLogFlushThread();
+
 #endif // BITCOIN_LOGGING_H
