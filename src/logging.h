@@ -289,4 +289,6 @@ static inline bool LogAcceptCategory(BCLog::LogFlags category, BCLog::Level leve
     return LogInstance().WillLogCategoryLevel(category, level);
 }
 
+void StopDebugLogFlushThread();
+
 #endif // BITCOIN_LOGGING_H
