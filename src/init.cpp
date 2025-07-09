@@ -409,6 +409,8 @@ void Shutdown(NodeContext& node)
     RemovePidFile(*node.args);
 
     LogInfo("Shutdown done");
+
+    StopDebugLogFlushThread();
 }
 
 /**

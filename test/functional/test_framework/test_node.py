@@ -44,7 +44,7 @@ from .util import (
     tor_port,
 )
 
-BITCOIND_PROC_WAIT_TIMEOUT = 60
+BITCOIND_PROC_WAIT_TIMEOUT = 600 # Increased from 60 to 600 due to log ring buffer
 # The size of the blocks xor key
 # from InitBlocksdirXorKey::xor_key.size()
 NUM_XOR_BYTES = 8
