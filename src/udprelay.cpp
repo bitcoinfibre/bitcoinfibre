@@ -78,12 +78,12 @@ static inline void SendMessageToNode(const UDPMessage& msg, unsigned int length,
             return;
 
         if ((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_HEADER) {
-            if (chunks_avail_it->second.IsHeaderChunkAvailable(le32toh(msg.msg.block.chunk_id)))
+            if (chunks_avail_it->second.IsHeaderChunkAvailable(le32toh_internal(msg.msg.block.chunk_id)))
                 return;
         } else {
             if (!chunks_avail_it->second.IsBlockDataChunkCountSet())
-                chunks_avail_it->second.SetBlockDataChunkCount(DIV_CEIL(le32toh(msg.msg.block.obj_length), sizeof(UDPBlockMessage::data)));
-            if (chunks_avail_it->second.IsBlockChunkAvailable(le32toh(msg.msg.block.chunk_id)))
+                chunks_avail_it->second.SetBlockDataChunkCount(DIV_CEIL(le32toh_internal(msg.msg.block.obj_length), sizeof(UDPBlockMessage::data)));
+            if (chunks_avail_it->second.IsBlockChunkAvailable(le32toh_internal(msg.msg.block.chunk_id)))
                 return;
         }
     }
@@ -92,9 +92,9 @@ static inline void SendMessageToNode(const UDPMessage& msg, unsigned int length,
 
     if (use_chunks_avail) {
         if ((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_HEADER)
-            chunks_avail_it->second.SetHeaderChunkAvailable(le32toh(msg.msg.block.chunk_id));
+            chunks_avail_it->second.SetHeaderChunkAvailable(le32toh_internal(msg.msg.block.chunk_id));
         else if ((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_CONTENTS)
-            chunks_avail_it->second.SetBlockChunkAvailable(le32toh(msg.msg.block.chunk_id));
+            chunks_avail_it->second.SetBlockChunkAvailable(le32toh_internal(msg.msg.block.chunk_id));
     }
 }
 
@@ -104,7 +104,7 @@ static void SendMessageToAllNodes(const UDPMessage& msg, unsigned int length, bo
 }
 
 static void CopyMessageData(UDPMessage& msg, const std::vector<unsigned char>& data, size_t msg_chunks, uint16_t chunk_id) {
-    msg.msg.block.chunk_id = htole16(chunk_id);
+    msg.msg.block.chunk_id = htole16_internal(chunk_id);
 
     size_t msg_size = chunk_id == msg_chunks - 1 ? (data.size() % FEC_CHUNK_SIZE) : sizeof(msg.msg.block.data);
     if (msg_size == 0) msg_size = FEC_CHUNK_SIZE;
@@ -153,7 +153,7 @@ struct DataFECer {
 static void CopyFECData(UDPMessage& msg, DataFECer& fec, size_t msg_chunks, size_t array_idx) {
     assert(fec.enc.BuildChunk(array_idx)); // TODO: Handle errors?
     assert(fec.fec_data.second[array_idx] < (1 << 24));
-    msg.msg.block.chunk_id = htole32(fec.fec_data.second[array_idx]);
+    msg.msg.block.chunk_id = htole32_internal(fec.fec_data.second[array_idx]);
     memcpy(msg.msg.block.data, &fec.fec_data.first[array_idx], FEC_CHUNK_SIZE);
 }
 
@@ -180,8 +180,8 @@ static void SendFECData(UDPMessage& msg, DataFECer& fec, const size_t msg_chunks
 
 static inline void FillCommonMessageHeader(UDPMessage& msg, const uint64_t hash_prefix, uint8_t type, const std::vector<unsigned char>& data) {
     msg.header.msg_type        = type;
-    msg.msg.block.hash_prefix  = htole64(hash_prefix);
-    msg.msg.block.obj_length   = htole32(data.size());
+    msg.msg.block.hash_prefix  = htole64_internal(hash_prefix);
+    msg.msg.block.obj_length   = htole32_internal(data.size());
 }
 
 static inline void FillBlockMessageHeader(UDPMessage& msg, const uint64_t hash_prefix, UDPMessageType type, const std::vector<unsigned char>& data) {
@@ -822,9 +822,9 @@ PartialBlockData::PartialBlockData(const CService& node, CTxMemPool* mempool, co
     }
 
 static void BlockMsgHToLE(UDPMessage& msg) {
-    msg.msg.block.hash_prefix = htole64(msg.msg.block.hash_prefix);
-    msg.msg.block.obj_length  = htole32(msg.msg.block.obj_length);
-    msg.msg.block.chunk_id    = htole32(msg.msg.block.chunk_id);
+    msg.msg.block.hash_prefix = htole64_internal(msg.msg.block.hash_prefix);
+    msg.msg.block.obj_length  = htole32_internal(msg.msg.block.obj_length);
+    msg.msg.block.chunk_id    = htole32_internal(msg.msg.block.chunk_id);
 }
 
 static bool HandleTx(UDPMessage& msg, size_t length, const CService& node, UDPConnectionState& state, const node::NodeContext* const node_context) {
@@ -898,9 +898,9 @@ bool HandleBlockTxMessage(UDPMessage& msg, size_t length, const CService& node, 
         return false;
     }
 
-    msg.msg.block.hash_prefix = le64toh(msg.msg.block.hash_prefix);
-    msg.msg.block.obj_length  = le32toh(msg.msg.block.obj_length);
-    msg.msg.block.chunk_id    = le32toh(msg.msg.block.chunk_id);
+    msg.msg.block.hash_prefix = le64toh_internal(msg.msg.block.hash_prefix);
+    msg.msg.block.obj_length  = le32toh_internal(msg.msg.block.obj_length);
+    msg.msg.block.chunk_id    = le32toh_internal(msg.msg.block.chunk_id);
 
     if ((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_TX_CONTENTS)
         return HandleTx(msg, length, node, state, node_context);
