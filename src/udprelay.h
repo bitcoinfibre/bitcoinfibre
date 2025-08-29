@@ -9,7 +9,7 @@
 
 void UDPRelayBlock(const CBlock& block);
 
-void BlockRecvInit(ChainstateManager* chainman);
+void BlockRecvInit(ChainstateManager* chainman, PeerManager* peer_manager);
 
 void BlockRecvShutdown();
 

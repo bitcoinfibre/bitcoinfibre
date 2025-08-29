@@ -535,6 +535,7 @@ public:
     bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     std::vector<node::TxOrphanage::OrphanInfo> GetOrphanTransactions() override EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
     PeerManagerInfo GetInfo() const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+    std::shared_ptr<const std::vector<std::pair<Wtxid, CTransactionRef>>> GetExtraTxnForCompact() override EXCLUSIVE_LOCKS_REQUIRED(!m_snapshot_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RelayTransaction(const Txid& txid, const Wtxid& wtxid) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SetBestBlock(int height, std::chrono::seconds time) override
@@ -604,12 +605,12 @@ private:
      */
     std::optional<node::PackageToValidate> ProcessInvalidTx(NodeId nodeid, const CTransactionRef& tx, const TxValidationState& result,
                                                       bool first_time_failure)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, g_msgproc_mutex, m_tx_download_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, g_msgproc_mutex, m_tx_download_mutex, !m_snapshot_mutex);
 
     /** Handle a transaction whose result was MempoolAcceptResult::ResultType::VALID.
      * Updates m_txrequest, m_orphanage, and vExtraTxnForCompact. Also queues the tx for relay. */
     void ProcessValidTx(NodeId nodeid, const CTransactionRef& tx, const std::list<CTransactionRef>& replaced_transactions)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, g_msgproc_mutex, m_tx_download_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, g_msgproc_mutex, m_tx_download_mutex, !m_snapshot_mutex);
 
     /** Handle the results of package validation: calls ProcessValidTx and ProcessInvalidTx for
      * individual transactions, and caches rejection for the package as a group.
@@ -969,7 +970,7 @@ private:
     /** Number of peers from which we're downloading blocks. */
     int m_peers_downloading_from GUARDED_BY(cs_main) = 0;
 
-    void AddToCompactExtraTransactions(const CTransactionRef& tx) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    void AddToCompactExtraTransactions(const CTransactionRef& tx) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_snapshot_mutex);
 
     /** Orphan/conflicted/etc transactions that are kept for compact block reconstruction.
      *  The last -blockreconstructionextratxn/DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN of
@@ -977,6 +978,10 @@ private:
     std::vector<std::pair<Wtxid, CTransactionRef>> vExtraTxnForCompact GUARDED_BY(g_msgproc_mutex);
     /** Offset into vExtraTxnForCompact to insert the next tx */
     size_t vExtraTxnForCompactIt GUARDED_BY(g_msgproc_mutex) = 0;
+
+    /** Snapshot of vExtraTxnForCompact for UDP processing */
+    mutable Mutex m_snapshot_mutex;
+    std::shared_ptr<const std::vector<std::pair<Wtxid, CTransactionRef>>> m_extra_txn_snapshot GUARDED_BY(m_snapshot_mutex);
 
     /** Check whether the last unknown block a peer advertised is not yet known. */
     void ProcessBlockAvailability(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -1762,6 +1767,17 @@ PeerManagerInfo PeerManagerImpl::GetInfo() const
     };
 }
 
+
+std::shared_ptr<const std::vector<std::pair<Wtxid, CTransactionRef>>> PeerManagerImpl::GetExtraTxnForCompact()
+{
+    LOCK(m_snapshot_mutex);
+    if (!m_extra_txn_snapshot) {
+        // Initialize with empty vector if not yet created
+        m_extra_txn_snapshot = std::make_shared<const std::vector<std::pair<Wtxid, CTransactionRef>>>();
+    }
+    return m_extra_txn_snapshot;
+}
+
 void PeerManagerImpl::AddToCompactExtraTransactions(const CTransactionRef& tx)
 {
     if (m_opts.max_extra_txs <= 0)
@@ -1770,6 +1786,13 @@ void PeerManagerImpl::AddToCompactExtraTransactions(const CTransactionRef& tx)
         vExtraTxnForCompact.resize(m_opts.max_extra_txs);
     vExtraTxnForCompact[vExtraTxnForCompactIt] = std::make_pair(tx->GetWitnessHash(), tx);
     vExtraTxnForCompactIt = (vExtraTxnForCompactIt + 1) % m_opts.max_extra_txs;
+
+    // Create snapshot outside of m_snapshot_mutex to avoid lock ordering issues
+    auto snapshot = std::make_shared<const std::vector<std::pair<Wtxid, CTransactionRef>>>(vExtraTxnForCompact);
+    {
+        LOCK(m_snapshot_mutex);
+        m_extra_txn_snapshot = snapshot;
+    }
 }
 
 void PeerManagerImpl::Misbehaving(Peer& peer, const std::string& message)
@@ -2981,6 +3004,7 @@ std::optional<node::PackageToValidate> PeerManagerImpl::ProcessInvalidTx(NodeId 
                                        bool first_time_failure)
 {
     AssertLockNotHeld(m_peer_mutex);
+    AssertLockNotHeld(m_snapshot_mutex);
     AssertLockHeld(g_msgproc_mutex);
     AssertLockHeld(m_tx_download_mutex);
 
@@ -3007,6 +3031,7 @@ std::optional<node::PackageToValidate> PeerManagerImpl::ProcessInvalidTx(NodeId 
 void PeerManagerImpl::ProcessValidTx(NodeId nodeid, const CTransactionRef& tx, const std::list<CTransactionRef>& replaced_transactions)
 {
     AssertLockNotHeld(m_peer_mutex);
+    AssertLockNotHeld(m_snapshot_mutex);
     AssertLockHeld(g_msgproc_mutex);
     AssertLockHeld(m_tx_download_mutex);
 
