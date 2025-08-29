@@ -506,7 +506,7 @@ static void DoBackgroundBlockProcessing(const std::pair<std::pair<uint64_t, CSer
     block_process_cv.notify_all();
 }
 
-static void ProcessBlockThread(ChainstateManager* chainman) {
+static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_manager) {
     const bool fBench = LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug);
 
     while (true) {
@@ -561,7 +561,8 @@ static void ProcessBlockThread(ChainstateManager* chainman) {
                 if (fBench)
                     header_deserialized = std::chrono::steady_clock::now();
 
-                ReadStatus decode_status = block.ProvideHeaderData(header);
+                    auto extra_txn = peer_manager->GetExtraTxnForCompact();
+                    ReadStatus decode_status = block.ProvideHeaderData(header, *extra_txn);
                 if (decode_status != READ_STATUS_OK) {
                     lock.unlock();
                     std::lock_guard<std::recursive_mutex> udpNodesLock(cs_mapUDPNodes);
@@ -754,9 +755,9 @@ static void ProcessBlockThread(ChainstateManager* chainman) {
     }
 }
 
-void BlockRecvInit(ChainstateManager* chainman)
+void BlockRecvInit(ChainstateManager* chainman, PeerManager* peer_manager)
 {
-    process_block_thread.reset(new std::thread(&util::TraceThread, "udpprocess", std::function<void()>(std::bind(&ProcessBlockThread, chainman))));
+    process_block_thread.reset(new std::thread(&util::TraceThread, "udpprocess", std::function<void()>(std::bind(&ProcessBlockThread, chainman, peer_manager))));
 }
 
 void BlockRecvShutdown() {
@@ -768,13 +769,11 @@ void BlockRecvShutdown() {
     }
 }
 
-// TODO: Use the one from net_processing (with appropriate lock-free-ness)
-static std::vector<std::pair<Wtxid, CTransactionRef>> udpnet_dummy_extra_txn;
-ReadStatus PartialBlockData::ProvideHeaderData(const CBlockHeaderAndLengthShortTxIDs& header) {
+ReadStatus PartialBlockData::ProvideHeaderData(const CBlockHeaderAndLengthShortTxIDs& header, const std::vector<std::pair<Wtxid, CTransactionRef>>& extra_txn) {
     assert(in_header);
     in_header = false;
     initialized = false;
-    return block_data.InitData(header, udpnet_dummy_extra_txn);
+    return block_data.InitData(header, extra_txn);
 }
 
 bool PartialBlockData::Init(const UDPMessage& msg) {
