@@ -329,7 +329,7 @@ bool InitializeUDPConnections(node::NodeContext* const node_context) {
         udp_local_read_thread.reset(new std::thread(&util::TraceThread, "udpreadlocal", &ThreadRunLocalReadEventLoop));
     }
 
-    BlockRecvInit(node_context->chainman.get());
+    BlockRecvInit(node_context->chainman.get(), node_context->peerman.get());
 
     udp_read_thread.reset(new std::thread(&util::TraceThread, "udpread", &ThreadRunReadEventLoop));
 
