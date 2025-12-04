@@ -968,32 +968,87 @@ static void StartLocalBackfillThread() {
                 {
                     std::set<Txid> txids_to_send;
                     LOCK(g_node_context->mempool->cs);
-                    for (const auto& iter : g_node_context->mempool->mapTx.get<ancestor_score>()) {
-                        if (txn_to_send.size() >= send_txn)
-                            break;
-                        if (txids_to_send.count(iter.GetTx().GetHash()) || sent_txn_bloom.contains(MakeUCharSpan(iter.GetTx().GetHash())))
-                            continue;
 
-                        std::vector<CTransactionRef> to_add{iter.GetSharedTx()};
-                        while (!to_add.empty()) {
-                            bool has_dep = false;
-                            for (const CTxIn& txin : to_add.back()->vin) {
-                                CTxMemPool::txiter init = g_node_context->mempool->mapTx.find(txin.prevout.hash);
-                                if (init != g_node_context->mempool->mapTx.end() && !txids_to_send.count(txin.prevout.hash)) {
-                                    to_add.emplace_back(init->GetSharedTx());
-                                    has_dep = true;
-                                }
+                    // Use the same chunk-based ordering that block assembly uses
+                    g_node_context->mempool->StartBlockBuilding();
+
+                    std::vector<CTxMemPoolEntry::CTxMemPoolEntryRef> chunk_entries;
+
+                    while (txn_to_send.size() < send_txn) {
+                        chunk_entries.clear();
+
+                        // Get the current best chunk (entries are returned in a valid order
+                        // for block inclusion with their ancestors bundled together).
+                        g_node_context->mempool->GetBlockBuilderChunk(chunk_entries);
+                        if (chunk_entries.empty()) {
+                            // No more chunks to consider
+                            break;
+                        }
+
+                        bool chunk_used = false;
+
+                        for (const auto& entry_ref : chunk_entries) {
+                            if (txn_to_send.size() >= send_txn) {
+                                break;
                             }
-                            if (!has_dep) {
-                                if (txids_to_send.insert(to_add.back()->GetHash()).second) {
-                                    sent_txn_bloom.insert(MakeUCharSpan(to_add.back()->GetHash()));
-                                    txn_to_send.emplace_back(std::move(to_add.back()));
+
+                            const CTxMemPoolEntry& entry = entry_ref.get();
+                            const Txid& txid = entry.GetTx().GetHash();
+
+                            // Skip if we've already selected it for this batch, or if we've
+                            // already sent it recently according to the bloom filter
+                            if (txids_to_send.count(txid) ||
+                                sent_txn_bloom.contains(MakeUCharSpan(txid))) {
+                                continue;
+                            }
+
+                            // Preserve the old behaviour: walk ancestors in the mempool
+                            // and make sure they are sent before the child.
+                            std::vector<CTransactionRef> to_add;
+                            to_add.emplace_back(entry.GetSharedTx());
+
+                            while (!to_add.empty() && txn_to_send.size() < send_txn) {
+                                bool has_dep = false;
+                                const CTransactionRef& txref = to_add.back();
+
+                                // Look for in-mempool parents that we haven’t already
+                                // added to this batch.
+                                for (const CTxIn& txin : txref->vin) {
+                                    auto it = g_node_context->mempool->mapTx.find(txin.prevout.hash);
+                                    if (it != g_node_context->mempool->mapTx.end() &&
+                                        !txids_to_send.count(txin.prevout.hash)) {
+                                        to_add.emplace_back(it->GetSharedTx());
+                                        has_dep = true;
+                                    }
                                 }
-                                to_add.pop_back();
+
+                                if (!has_dep) {
+                                    const Txid& h = txref->GetHash();
+                                    if (txids_to_send.insert(h).second) {
+                                        // Remember that we've sent this tx recently
+                                        sent_txn_bloom.insert(MakeUCharSpan(h));
+                                        txn_to_send.emplace_back(txref);
+                                        chunk_used = true;
+                                    }
+                                    to_add.pop_back();
+                                }
                             }
                         }
+
+                        // Tell the block builder how to advance:
+                        //  - IncludeChunk if we actually used something from this chunk
+                        //  - SkipChunk if it was all already-sent transactions
+                        if (chunk_used) {
+                            g_node_context->mempool->IncludeBuilderChunk();
+                        } else {
+                            g_node_context->mempool->SkipBuilderChunk();
+                        }
                     }
+
+                    g_node_context->mempool->StopBlockBuilding();
                 }
+
+                // Send any selected mempool transactions over UDP
                 for (const CTransactionRef& tx : txn_to_send) {
                     std::vector<UDPMessage> msgs;
                     UDPFillMessagesFromTx(*tx, msgs);
