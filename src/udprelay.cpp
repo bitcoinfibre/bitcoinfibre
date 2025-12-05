@@ -332,6 +332,13 @@ void UDPRelayBlock(const CBlock& block) {
             return;
 
          // METRIC 4: Timestamp of first header packet compared to timestamp of first node initializing the sends (Send-side)
+         bool trace_active = false;
+        if (fBench || trace_active) {
+            int64_t send_start_us = TicksSinceEpoch<std::chrono::microseconds>(SystemClock::now());
+            if (fBench) {
+                LogInfo("UDP: Starting header send for block %s at %d us\n", hashBlock.ToString(), send_start_us);
+            }
+        }
 
         SendFECedData(hashBlock, MSG_TYPE_BLOCK_HEADER, data, header_fecer);
 
@@ -399,6 +406,17 @@ static void DoBackgroundBlockProcessing(const std::pair<std::pair<uint64_t, CSer
     block_process_cv.notify_all();
 }
 
+static void LogCoinbaseScriptSig(const CBlock& block)
+{
+    if (block.vtx.empty() || block.vtx[0]->vin.empty()) return;
+
+    const CScript& scriptSig = block.vtx[0]->vin[0].scriptSig;
+
+    // Just log the hex - no processing in hot path
+    LogInfo("UDP: block=%s scriptsig=%s\n",
+              block.GetHash().ToString(),
+              HexStr(scriptSig));
+}
 
 static void ReplayPendingBodyPackets(const std::pair<std::pair<uint64_t, CService>, std::shared_ptr<PartialBlockData>>& process_block,
                                      const node::NodeContext* node_context)
@@ -563,6 +581,45 @@ static void ProcessBlockThread(const node::NodeContext* node_context) {
                 } else {
                     std::shared_ptr<const CBlock> pdecoded_block = block.block_data.GetBlock();
                     const CBlock& decoded_block = *pdecoded_block;
+                    bool trace_active_cb = false;
+                    bool trace_active_rc = false;
+                    bool trace_active_rd = false;
+                    if (fBench || trace_active_cb || trace_active_rc || trace_active_rd) {
+                        std::string src  = UDPLogPeer(block.nodeHeaderRecvd); // What IP sent us the block?
+
+                        uint32_t total_chunks_recvd = 0, total_chunks_used = 0;
+                        std::map<CService, std::pair<uint32_t, uint32_t>>& chunksProvidedByNode = block.nodesWithChunksAvailableSet;
+                        for (const auto& provider : chunksProvidedByNode) {
+                            total_chunks_recvd += provider.second.second;
+                            total_chunks_used += provider.second.first;
+                        }
+                        // METRIC 1: Which pool generated the block
+                        // METRIC 2: How many chunks did it take others to receive it
+                        // METRIC 3: How long did it take to reconstruct the block from first header packet
+                        /*
+                            Per-block, per-receiver:
+
+                            total_chunks_used – how many FEC chunks were actually needed to reconstruct the block.
+                            total_chunks_recvd – how many chunks were received in total.
+                            nodesWithChunksAvailableSet – breakdown per upstream node (used / received).
+                            to_millis_double(now - block.timeHeaderRecvd) – time from first header packet (for the block we actually decoded) to fully reconstructed block.
+
+                            That last value is exactly how long did it take to reconstruct the block from first header packet (all-in FIBRE overhead).
+                        */
+                       if (fBench) {
+                            LogCoinbaseScriptSig(decoded_block);
+                            LogInfo("UDP: Block %s reconstructed from %s with %u chunks in %lf ms (%u recvd from %u peers)\n",
+                                decoded_block.GetHash().ToString(),
+                                src,
+                                total_chunks_used,
+                                to_millis_double(std::chrono::steady_clock::now() - block.timeHeaderRecvd),
+                                total_chunks_recvd,
+                                chunksProvidedByNode.size()
+                            );
+                            for (const auto& provider : chunksProvidedByNode)
+                                LogInfo("UDP:    %u/%u used from %s\n", provider.second.first, provider.second.second, UDPLogPeer(provider.first));
+                        }
+                    }
 
                     lock.unlock();
 
@@ -744,7 +801,9 @@ static void BlockMsgHToLE(UDPMessage& msg) {
 
 bool HandleBlockMessage(UDPMessage& msg, size_t length, const CService& node, UDPConnectionState& state, const std::chrono::steady_clock::time_point& packet_process_start, const node::NodeContext* node_context, BlockMessageOrigin origin) {
     //TODO: There are way too many damn tree lookups here...either cut them down or increase parallelism
-    const bool collect_timing = false;
+    const bool fBench = util::log::ShouldDebugLog(BCLog::BENCH);
+    const bool trace_active = false;
+    const bool collect_timing = fBench || trace_active;
     // Trusted packets are forwarded on network receipt, including while their
     // header is pending. Local replay feeds reconstruction only: forwarding
     // again would consume bandwidth and could promote a duplicate's priority.
@@ -823,12 +882,14 @@ bool HandleBlockMessage(UDPMessage& msg, size_t length, const CService& node, UD
         }
     }
 
+    bool new_block = false;
     std::map<std::pair<uint64_t, CService>, std::shared_ptr<PartialBlockData>>::iterator it = mapPartialBlocks.find(hash_peer_pair);
     if (it == mapPartialBlocks.end()) {
         if ((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_HEADER)
             it = mapPartialBlocks.insert(std::make_pair(std::make_pair(hash_prefix, state.connection.fTrusted ? TRUSTED_PEER_DUMMY : node), std::make_shared<PartialBlockData>(node, node_context->mempool.get(), msg, packet_process_start))).first;
         else // Probably stale (ie we just finished reconstructing)
             return true;
+        new_block = true;
     }
     PartialBlockData& block = *it->second;
 
@@ -977,6 +1038,12 @@ bool HandleBlockMessage(UDPMessage& msg, size_t length, const CService& node, UD
     }
 
     // METRIC 4: Timestamp of first header packet compared to timestamp of first node initializing the sends (Receive-side)
+    if (collect_timing && new_block) {
+        std::chrono::steady_clock::time_point finished(std::chrono::steady_clock::now());
+        if (fBench) {
+            LogInfo("UDP: Processed first block header chunk in %lf %lf %lf %lf\n", to_millis_double(start - packet_process_start), to_millis_double(maps_scanned - start), to_millis_double(chunks_processed - maps_scanned), to_millis_double(finished - chunks_processed));
+        }
+    }
 
     return true;
 }
