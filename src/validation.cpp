@@ -48,6 +48,7 @@
 #include <txdb.h>
 #include <txmempool.h>
 #include <udpapi.h>
+#include <fibrerace.h>
 #include <uint256.h>
 #include <undo.h>
 #include <util/check.h>
@@ -3186,6 +3187,10 @@ bool Chainstate::ConnectTip(
     // Update m_chain & related variables.
     m_chain.SetTip(*pindexNew);
     UpdateTip(pindexNew);
+
+    if (this == &m_chainman.ActiveChainstate()) {
+        FibreBlockRaceNotifyConnected(pindexNew->GetBlockHash(), pindexNew->nHeight, std::chrono::steady_clock::now());
+    }
 
     const auto time_6{SteadyClock::now()};
     m_chainman.time_post_connect += time_6 - time_5;

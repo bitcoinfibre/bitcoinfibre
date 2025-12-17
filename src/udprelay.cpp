@@ -13,6 +13,7 @@
 #include <util/thread.h>
 #include <util/time.h>
 #include <validation.h>
+#include <fibrerace.h>
 
 #include <algorithm>
 #include <condition_variable>
@@ -494,9 +495,9 @@ static void DoBackgroundBlockProcessing(const std::pair<std::pair<uint64_t, CSer
 static void LogCoinbaseScriptSig(const CBlock& block)
 {
     if (block.vtx.empty() || block.vtx[0]->vin.empty()) return;
-    
+
     const CScript& scriptSig = block.vtx[0]->vin[0].scriptSig;
-    
+
     // Just log the hex - no processing in hot path
     LogPrintf("UDP: block=%s scriptsig=%s\n",
               block.GetHash().ToString(),
@@ -579,6 +580,7 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                     break;
                 }
 
+                FibreBlockRaceRecordUDPStart(header.header.GetHash(), block.nodeHeaderRecvd.ToStringAddrPort(), block.timeHeaderRecvd);
                 if (block.block_data.IsBlockAvailable())
                     block.is_decodeable.store(true, std::memory_order_release);
                 block.is_header_processing.store(false, std::memory_order_release);
@@ -651,7 +653,7 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                             total_chunks_used += provider.second.first;
                         }
                         // METRIC 1: Which pool generated the block
-                        // METRIC 2: How many chunks did it take others to receive it 
+                        // METRIC 2: How many chunks did it take others to receive it
                         // METRIC 3: How long did it take to reconstruct the block from first header packet
                         /*
                             Per-block, per-receiver:
@@ -664,12 +666,12 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                             That last value is exactly how long did it take to reconstruct the block from first header packet (all-in FIBRE overhead).
                         */
                         LogCoinbaseScriptSig(decoded_block);
-                        LogPrintf("UDP: Block %s reconstructed from %s with %u chunks in %lf ms (%u recvd from %u peers)\n", 
+                        LogPrintf("UDP: Block %s reconstructed from %s with %u chunks in %lf ms (%u recvd from %u peers)\n",
                             decoded_block.GetHash().ToString(),
                             src,
-                            total_chunks_used, 
-                            to_millis_double(std::chrono::steady_clock::now() - block.timeHeaderRecvd), 
-                            total_chunks_recvd, 
+                            total_chunks_used,
+                            to_millis_double(std::chrono::steady_clock::now() - block.timeHeaderRecvd),
+                            total_chunks_recvd,
                             chunksProvidedByNode.size()
                         );
                         for (const auto& provider : chunksProvidedByNode)
@@ -683,6 +685,8 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                         process_start = std::chrono::steady_clock::now();
 
                     const bool force_requested = false;
+                    const std::string udp_peer = block.nodeHeaderRecvd.ToStringAddrPort();
+                    [[maybe_unused]] FibreBlockRaceConnectContextGuard race_ctx(decoded_block.GetHash(), "udp", udp_peer);
 
                     bool fNewBlock;
                     if (!chainman->ProcessNewBlock(pdecoded_block, force_requested, /*min_pow_checked=*/true, &fNewBlock)) {
@@ -816,10 +820,10 @@ PartialBlockData::PartialBlockData(const CService& node, CTxMemPool* mempool, co
 
     void PartialBlockData::ReconstructBlockFromDecoder() {
         assert(decoder.DecodeReady());
-    
+
         // Use the actual chunk count from block_data, not obj_length
         uint32_t chunk_count = block_data.GetChunkCount();
-        
+
         for (uint32_t i = 0; i < chunk_count; i++) {
             if (!block_data.IsChunkAvailable(i)) {
                 // Only copy if the decoder has this chunk
@@ -835,7 +839,7 @@ PartialBlockData::PartialBlockData(const CService& node, CTxMemPool* mempool, co
                 block_data.MarkChunkAvailable(i);
             }
         }
-    
+
         assert(block_data.IsBlockAvailable());
     }
 
