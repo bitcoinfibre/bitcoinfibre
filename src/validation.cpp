@@ -3090,6 +3090,9 @@ bool Chainstate::ConnectTip(
         m_chainman.m_options.signals->MempoolTransactionsRemovedForBlock(block_to_connect, std::move(txs_removed_for_block), pindexNew->nHeight);
     }
     UpdateTip(pindexNew);
+    if (this == &m_chainman.ActiveChainstate()) {
+        m_chainman.GetNotifications().blockConnected(*pindexNew);
+    }
 
     const auto time_6{SteadyClock::now()};
     m_chainman.time_post_connect += time_6 - time_5;

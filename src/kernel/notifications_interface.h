@@ -45,6 +45,10 @@ public:
     //! Optional so standalone kernel clients need no networking implementation.
     virtual void blockAccepted(const CBlock& block, const CBlockIndex& index) {}
 
+    //! Synchronous active-chain-only connection notification under cs_main.
+    //! The index remains valid for the duration of this call.
+    virtual void blockConnected(const CBlockIndex& index) {}
+
     virtual void headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync) {}
     virtual void progress(const bilingual_str& title, int progress_percent, bool resume_possible) {}
     virtual void warningSet(Warning id, const bilingual_str& message) {}
