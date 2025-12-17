@@ -13,6 +13,7 @@
 #include <util/thread.h>
 #include <util/time.h>
 #include <validation.h>
+#include <fibrerace.h>
 // USDT tracepoint semaphores for UDP metrics
 
 #include <algorithm>
@@ -518,6 +519,7 @@ static void ProcessBlockThread(const node::NodeContext* node_context) {
                     break;
                 }
 
+                FibreBlockRaceRecordUDPStart(header.header.GetHash(), UDPLogPeer(block.nodeHeaderRecvd), block.timeHeaderRecvd);
                 if (block.block_data.IsBlockAvailable())
                     block.is_decodeable.store(true, std::memory_order_release);
                 block.is_header_processing.store(false, std::memory_order_release);
@@ -628,6 +630,8 @@ static void ProcessBlockThread(const node::NodeContext* node_context) {
                         process_start = std::chrono::steady_clock::now();
 
                     const bool force_requested = false;
+                    const std::string udp_peer = UDPLogPeer(block.nodeHeaderRecvd);
+                    [[maybe_unused]] FibreBlockRaceConnectContextGuard race_ctx(decoded_block.GetHash(), "udp", udp_peer);
 
                     bool fNewBlock;
                     if (!chainman->ProcessNewBlock(pdecoded_block, force_requested, /*min_pow_checked=*/peer_manager->CheckFibreBlockWork(decoded_block), &fNewBlock)) {

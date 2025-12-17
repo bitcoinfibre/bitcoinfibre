@@ -195,6 +195,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   dbwrapper.cpp
   deploymentstatus.cpp
   fec.cpp
+  fibrerace.cpp
   fibre/udp_socket.cpp
   flatfile.cpp
   headerssync.cpp
