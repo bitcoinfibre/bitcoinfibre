@@ -47,6 +47,7 @@
 #include <txdb.h>
 #include <txmempool.h>
 #include <udpapi.h>
+#include <fibrerace.h>
 #include <uint256.h>
 #include <undo.h>
 #include <util/byte_units.h>
@@ -3099,6 +3100,10 @@ bool Chainstate::ConnectTip(
     m_chain.SetTip(*pindexNew);
     m_chainman.UpdateIBDStatus();
     UpdateTip(pindexNew);
+
+    if (this == &m_chainman.ActiveChainstate()) {
+        FibreBlockRaceNotifyConnected(pindexNew->GetBlockHash(), pindexNew->nHeight, std::chrono::steady_clock::now());
+    }
 
     const auto time_6{SteadyClock::now()};
     m_chainman.time_post_connect += time_6 - time_5;

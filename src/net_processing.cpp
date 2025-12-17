@@ -56,6 +56,7 @@
 #include <tinyformat.h>
 #include <txmempool.h>
 #include <uint256.h>
+#include <fibrerace.h>
 #include <util/check.h>
 #include <util/strencodings.h>
 #include <util/time.h>
@@ -3585,6 +3586,8 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
         // disk-space attacks), but this should be safe due to the
         // protections in the compact block handler -- see related comment
         // in compact block optimistic reconstruction handling.
+        const std::string cmpct_peer = pfrom.LogPeer();
+        [[maybe_unused]] FibreBlockRaceConnectContextGuard race_ctx(block_transactions.blockhash, "cmpctblock", cmpct_peer);
         ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true);
     }
     return;
@@ -4599,6 +4602,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
         }
 
+        const auto cmpct_recv_time = std::chrono::steady_clock::now();
+        std::string cmpct_peer;
+        bool record_cmpct_start{false};
+
         CBlockHeaderAndShortTxIDs cmpctblock;
         vRecv >> cmpctblock;
 
@@ -4707,6 +4714,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // We want to be a bit conservative just to be extra careful about DoS
         // possibilities in compact block processing...
         if (pindex->nHeight <= m_chainman.ActiveChain().Height() + 2) {
+            // Only record cmpctblock timing for candidates close enough to tip to matter.
+            record_cmpct_start = true;
             if ((already_in_flight < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK && nodestate->vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) ||
                  requested_block_from_this_peer) {
                 std::list<QueuedBlock>::iterator* queuedBlockIt = nullptr;
@@ -4800,6 +4809,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
         } // cs_main
 
+        if (record_cmpct_start) {
+            if (cmpct_peer.empty()) cmpct_peer = pfrom.LogPeer();
+            FibreBlockRaceRecordCmpctStart(blockhash, cmpct_peer, cmpct_recv_time);
+        }
+
         if (fProcessBLOCKTXN) {
             BlockTransactions txn;
             txn.blockhash = blockhash;
@@ -4831,6 +4845,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // we have a chain with at least the minimum chain work), and we ignore
             // compact blocks with less work than our tip, it is safe to treat
             // reconstructed compact blocks as having been requested.
+            if (cmpct_peer.empty()) cmpct_peer = pfrom.LogPeer();
+            [[maybe_unused]] FibreBlockRaceConnectContextGuard race_ctx(blockhash, "cmpctblock", cmpct_peer);
             ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true);
             LOCK(cs_main); // hold cs_main for CBlockIndex::IsValid()
             if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS)) {
