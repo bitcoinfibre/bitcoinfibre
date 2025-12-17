@@ -7,6 +7,7 @@
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <chain.h>
+#include <fibrerace.h>
 #include <common/args.h>
 #include <common/system.h>
 #include <kernel/context.h>
@@ -73,6 +74,10 @@ void KernelNotifications::blockAccepted(const CBlock& block, const CBlockIndex&)
     UDPRelayBlock(block);
 }
 
+void KernelNotifications::blockConnected(const CBlockIndex& index)
+{
+    FibreBlockRaceNotifyConnected(index.GetBlockHash(), index.nHeight, std::chrono::steady_clock::now());
+}
 
 void KernelNotifications::headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync)
 {
