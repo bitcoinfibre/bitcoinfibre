@@ -16,6 +16,7 @@
 #include <streams.h>
 #include <util/thread.h>
 #include <validation.h>
+#include <fibrerace.h>
 #include <node/protocol_version.h>
 
 #include <algorithm>
@@ -600,6 +601,7 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                     break;
                 }
 
+                FibreBlockRaceRecordUDPStart(header.header.GetHash(), block.nodeHeaderRecvd.ToStringAddrPort(), block.timeHeaderRecvd);
                 if (block.block_data.IsBlockAvailable())
                     block.is_decodeable.store(true, std::memory_order_release);
                 block.is_header_processing.store(false, std::memory_order_release);
@@ -704,6 +706,8 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                         process_start = std::chrono::steady_clock::now();
 
                     const bool force_requested = false;
+                    const std::string udp_peer = block.nodeHeaderRecvd.ToStringAddrPort();
+                    [[maybe_unused]] FibreBlockRaceConnectContextGuard race_ctx(decoded_block.GetHash(), "udp", udp_peer);
 
                     bool fNewBlock;
                     // if (!ProcessNewBlock(Params(), pdecoded_block, false, &fNewBlock)) {
@@ -838,10 +842,10 @@ PartialBlockData::PartialBlockData(const CService& node, CTxMemPool* mempool, co
 
     void PartialBlockData::ReconstructBlockFromDecoder() {
         assert(decoder.DecodeReady());
-    
+
         // Use the actual chunk count from block_data, not obj_length
         uint32_t chunk_count = block_data.GetChunkCount();
-        
+
         for (uint32_t i = 0; i < chunk_count; i++) {
             if (!block_data.IsChunkAvailable(i)) {
                 // Only copy if the decoder has this chunk
@@ -857,7 +861,7 @@ PartialBlockData::PartialBlockData(const CService& node, CTxMemPool* mempool, co
                 block_data.MarkChunkAvailable(i);
             }
         }
-    
+
         assert(block_data.IsBlockAvailable());
     }
 
