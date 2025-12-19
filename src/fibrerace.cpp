@@ -7,7 +7,10 @@
 #include <logging.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <util/trace.h>
 // USDT tracepoint semaphores for UDP metrics
+TRACEPOINT_SEMAPHORE(udp, block_race_winner);
+TRACEPOINT_SEMAPHORE(udp, block_race_time);
 
 #include <chrono>
 #include <deque>
@@ -174,7 +177,36 @@ void FibreBlockRaceNotifyConnected(const uint256& block_hash,
               cmpct_peer.empty() ? "n/a" : cmpct_peer);
     }
 
+    bool trace_active_cw = TRACEPOINT_ACTIVE(udp, block_race_winner);
 
+    if (trace_active_cw) {
+        // Emit tracepoint for block race outcome (UDP vs compact block)
+        TRACEPOINT(udp, block_race_winner,
+            block_hash.data(),                      // Block hash (32 bytes)
+            (int)height,                            // Block height
+            winner.c_str(),                         // Winner mechanism string
+            g_block_race_ctx.peer.empty() ? "n/a" : g_block_race_ctx.peer.c_str()   // Winner peer
+        );
+    }
 
+    bool trace_active_ct = TRACEPOINT_ACTIVE(udp, block_race_time);
 
+    if (trace_active_ct) {
+        [[maybe_unused]] int64_t udp_ns = info.udp_start_set && connected_time >= info.udp_start
+                    ? Ticks<std::chrono::nanoseconds>(connected_time - info.udp_start)
+                    : -1;
+        [[maybe_unused]] int64_t cmpct_ns = info.cmpct_start_set && connected_time >= info.cmpct_start
+                        ? Ticks<std::chrono::nanoseconds>(connected_time - info.cmpct_start)
+                        : -1;
+
+        // Emit tracepoint for block race outcome (UDP vs compact block)
+        TRACEPOINT(udp, block_race_time,
+            block_hash.data(),                      // Block hash (32 bytes)
+            (int)height,                            // Block height
+            udp_ns,                                 // UDP path time (ns or -1)
+            udp_peer.empty() ? "n/a" : udp_peer.c_str(),   // UDP peer
+            cmpct_ns,                               // Compact block path time (ns or -1)
+            cmpct_peer.empty() ? "n/a" : cmpct_peer.c_str() // Compact block peer
+        );
+    }
 }
