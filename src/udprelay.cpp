@@ -14,7 +14,12 @@
 #include <util/time.h>
 #include <validation.h>
 #include <fibrerace.h>
+#include <util/trace.h>
 // USDT tracepoint semaphores for UDP metrics
+TRACEPOINT_SEMAPHORE(udp, block_coinbase);
+TRACEPOINT_SEMAPHORE(udp, block_reconstructed);
+TRACEPOINT_SEMAPHORE(udp, block_send_start);
+TRACEPOINT_SEMAPHORE(udp, block_header_chunk);
 
 #include <algorithm>
 #include <condition_variable>
@@ -333,11 +338,14 @@ void UDPRelayBlock(const CBlock& block) {
             return;
 
          // METRIC 4: Timestamp of first header packet compared to timestamp of first node initializing the sends (Send-side)
-         bool trace_active = false;
+         bool trace_active = TRACEPOINT_ACTIVE(udp, block_send_start);
         if (fBench || trace_active) {
             int64_t send_start_us = TicksSinceEpoch<std::chrono::microseconds>(SystemClock::now());
             if (fBench) {
                 LogInfo("UDP: Starting header send for block %s at %d us\n", hashBlock.ToString(), send_start_us);
+            }
+            if (trace_active) {
+                TRACEPOINT(udp, block_send_start, hashBlock.ToString().c_str(), (int64_t) send_start_us);
             }
         }
 
@@ -583,8 +591,8 @@ static void ProcessBlockThread(const node::NodeContext* node_context) {
                 } else {
                     std::shared_ptr<const CBlock> pdecoded_block = block.block_data.GetBlock();
                     const CBlock& decoded_block = *pdecoded_block;
-                    bool trace_active_cb = false;
-                    bool trace_active_rc = false;
+                    bool trace_active_cb = TRACEPOINT_ACTIVE(udp, block_coinbase);
+                    bool trace_active_rc = TRACEPOINT_ACTIVE(udp, block_reconstructed);
                     bool trace_active_rd = false;
                     if (fBench || trace_active_cb || trace_active_rc || trace_active_rd) {
                         std::string src  = UDPLogPeer(block.nodeHeaderRecvd); // What IP sent us the block?
@@ -620,6 +628,21 @@ static void ProcessBlockThread(const node::NodeContext* node_context) {
                             );
                             for (const auto& provider : chunksProvidedByNode)
                                 LogInfo("UDP:    %u/%u used from %s\n", provider.second.first, provider.second.second, UDPLogPeer(provider.first));
+                        }
+                        if (trace_active_cb && !decoded_block.vtx.empty() && !decoded_block.vtx[0]->vin.empty()) {
+                            std::string coinbase_hex = HexStr(decoded_block.vtx[0]->vin[0].scriptSig);
+                            TRACEPOINT(udp, block_coinbase,
+                                       decoded_block.GetHash().ToString().c_str(),
+                                       coinbase_hex.c_str());
+                        }
+                        if (trace_active_rc) {
+                            TRACEPOINT(udp, block_reconstructed,
+                                       decoded_block.GetHash().ToString().c_str(),
+                                       src.c_str(),
+                                       (uint32_t) total_chunks_used,
+                                       (uint32_t) total_chunks_recvd,
+                                       (uint32_t) chunksProvidedByNode.size(),
+                                       (int64_t) Ticks<std::chrono::microseconds>(SteadyClock::now() - block.timeHeaderRecvd));
                         }
                     }
 
@@ -806,7 +829,7 @@ static void BlockMsgHToLE(UDPMessage& msg) {
 bool HandleBlockMessage(UDPMessage& msg, size_t length, const CService& node, UDPConnectionState& state, const std::chrono::steady_clock::time_point& packet_process_start, const node::NodeContext* node_context, BlockMessageOrigin origin) {
     //TODO: There are way too many damn tree lookups here...either cut them down or increase parallelism
     const bool fBench = util::log::ShouldDebugLog(BCLog::BENCH);
-    const bool trace_active = false;
+    const bool trace_active = TRACEPOINT_ACTIVE(udp, block_header_chunk);
     const bool collect_timing = fBench || trace_active;
     // Trusted packets are forwarded on network receipt, including while their
     // header is pending. Local replay feeds reconstruction only: forwarding
@@ -1046,6 +1069,19 @@ bool HandleBlockMessage(UDPMessage& msg, size_t length, const CService& node, UD
         std::chrono::steady_clock::time_point finished(std::chrono::steady_clock::now());
         if (fBench) {
             LogInfo("UDP: Processed first block header chunk in %lf %lf %lf %lf\n", to_millis_double(start - packet_process_start), to_millis_double(maps_scanned - start), to_millis_double(chunks_processed - maps_scanned), to_millis_double(finished - chunks_processed));
+        }
+        if (trace_active) {
+            [[maybe_unused]] uint64_t hash_prefix = it->first.first;
+            [[maybe_unused]] int64_t dur1_us = Ticks<std::chrono::microseconds>(start - packet_process_start);
+            [[maybe_unused]] int64_t dur2_us = Ticks<std::chrono::microseconds>(maps_scanned - start);
+            [[maybe_unused]] int64_t dur3_us = Ticks<std::chrono::microseconds>(chunks_processed - maps_scanned);
+            [[maybe_unused]] int64_t dur4_us = Ticks<std::chrono::microseconds>(finished - chunks_processed);
+            TRACEPOINT(udp, block_header_chunk,
+                       (uint64_t) hash_prefix,
+                       (int64_t) dur1_us,
+                       (int64_t) dur2_us,
+                       (int64_t) dur3_us,
+                       (int64_t) dur4_us);
         }
     }
 
