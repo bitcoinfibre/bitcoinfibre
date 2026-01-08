@@ -202,4 +202,4 @@ void SendMessage(const UDPMessage& msg, const unsigned int length, bool high_pri
 void SendMessage(const UDPMessage& msg, const unsigned int length, bool high_prio, const std::map<CService, UDPConnectionState>::const_iterator& node);
 void DisconnectNode(const std::map<CService, UDPConnectionState>::iterator& it);
 
-#endif
+#endif // BITCOIN_UDPNET_H
