@@ -2343,7 +2343,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     // Start UDP at the very end since it has no concept of whether the res of the code is already up or not
 
-    if (GetUDPInboundPorts().size() || gArgs.GetArg("-fecwritedevice", "") != "") {
+    if (GetUDPInboundPorts().size()) {
         if (!InitializeUDPConnections(&node))
             return InitError(_("Failed to check the UDP listen port - is something else already bound to this port?"));
     }
