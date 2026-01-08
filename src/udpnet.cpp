@@ -7,7 +7,6 @@
 #include <udpapi.h>
 #include <udprelay.h>
 
-#include <bitcoin-build-config.h>
 #include <common/args.h>
 #include <common/bloom.h>
 #include <compat/endian.h>
@@ -26,7 +25,6 @@
 #include <validation.h>
 
 #include <span.h>
-#include <sys/socket.h>
 
 #include <event2/event.h>
 
