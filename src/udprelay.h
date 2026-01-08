@@ -7,7 +7,7 @@
 
 #include <udpnet.h>
 
-void UDPRelayBlock(const CBlock& block);
+// UDPRelayBlock is declared in udpapi.h (included via udpnet.h)
 
 void BlockRecvInit(ChainstateManager* chainman, PeerManager* peer_manager);
 
