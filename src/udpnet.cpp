@@ -63,7 +63,6 @@
 #define to_millis_double(t) (std::chrono::duration_cast<std::chrono::duration<double, std::chrono::milliseconds::period> >(t).count())
 
 static std::vector<int> udp_socks; // The sockets we use to send/recv (bound to *:GetUDPInboundPorts()[*])
-static bool last_sock_is_local;
 
 std::recursive_mutex cs_mapUDPNodes;
 std::map<CService, UDPConnectionState> mapUDPNodes;
@@ -74,10 +73,6 @@ static std::map<int64_t, std::tuple<CService, uint64_t, size_t> > nodesToRepeatD
 static std::map<CService, UDPConnectionInfo> mapPersistentNodes;
 
 static node::NodeContext* g_node_context; // Initialized by InitializeUDPConnections
-
-static CService LOCAL_WRITE_DEVICE_SERVICE(CNetAddr(), 1);
-
-#define LOCAL_DEVICE_CHECKSUM_MAGIC htole64_internal(0xdeadbeef)
 
 // TODO: The checksum stuff is not endian-safe (esp the poly impl):
 static void FillChecksum(uint64_t magic, UDPMessage& msg, const unsigned int length)
@@ -144,17 +139,13 @@ static struct timeval timer_interval;
 static void ThreadRunReadEventLoop() { event_base_dispatch(event_base_read); }
 static void do_send_messages();
 static void send_messages_flush_and_break();
-static void send_messages_init(const std::vector<std::pair<unsigned short, uint64_t> >& group_list, const std::tuple<int64_t, bool, std::string>& local_write_device);
+static void send_messages_init(const std::vector<std::pair<unsigned short, uint64_t> >& group_list);
 static void ThreadRunWriteEventLoop() { do_send_messages(); }
 
 static void read_socket_func(evutil_socket_t fd, short event, void* arg);
 static void timer_func(evutil_socket_t fd, short event, void* arg);
 static std::unique_ptr<std::thread> udp_read_thread;
 static std::vector<std::thread> udp_write_threads;
-
-static void OpenLocalDeviceConnection();
-static void StartLocalBackfillThread();
-static std::tuple<int64_t, bool, std::string> get_local_device();
 
 static void AddConnectionFromString(const std::string& node, bool fTrust) {
     size_t host_port_end = node.find(',');
@@ -282,19 +273,6 @@ bool InitializeUDPConnections(node::NodeContext* const node_context) {
         event_add(read_event, NULL);
     }
 
-    // Init local write device only after udp socks were all added to read_event
-    auto local_write_device = get_local_device();
-    if (std::get<0>(local_write_device)) {
-        int fd = open(std::get<2>(local_write_device).c_str(), O_WRONLY);
-        if (fd < 0) {
-            LogPrintf("Failed to open -fecwritedevice, not running any FIBRE connections\n");
-            event_base_free(event_base_read);
-            CloseSocketsAndReadEvents();
-            return false;
-        }
-        udp_socks.push_back(fd);
-    }
-
     timer_event = event_new(event_base_read, -1, EV_PERSIST, timer_func, NULL);
     if (!timer_event) {
         CloseSocketsAndReadEvents();
@@ -305,16 +283,10 @@ bool InitializeUDPConnections(node::NodeContext* const node_context) {
     timer_interval.tv_usec = 500*1000;
     evtimer_add(timer_event, &timer_interval);
 
-    send_messages_init(group_list, local_write_device);
+    send_messages_init(group_list);
     udp_write_threads.emplace_back(&util::TraceThread, "udpwrite", &ThreadRunWriteEventLoop);
 
     AddConfAddedConnections();
-
-    if (std::get<0>(local_write_device)) {
-        OpenLocalDeviceConnection();
-        if (std::get<1>(local_write_device))
-            StartLocalBackfillThread();
-    }
 
     BlockRecvInit(node_context->chainman.get(), node_context->peerman.get());
 
@@ -615,7 +587,6 @@ struct PerGroupMessageQueue {
 };
 static std::vector<PerGroupMessageQueue> messageQueues;
 static const size_t LOCAL_RECEIVE_GROUP = (size_t)-1;
-static size_t LOCAL_SEND_GROUP = (size_t)-1;
 
 static inline void SendMessage(const UDPMessage& msg, const unsigned int length, PerGroupMessageQueue& queue, PendingMessagesBuff& buff, const CService& service, const uint64_t magic) {
     std::unique_lock<std::mutex> lock(send_messages_mutex);
@@ -658,7 +629,7 @@ struct PerQueueSendState {
     MessageStateCache buff_state;
     std::chrono::steady_clock::time_point next_send;
     size_t write_objs_per_call, bytes_per_obj, target_bytes_per_sec;
-    bool local, buff_emptied;
+    bool buff_emptied;
 };
 
 static inline bool fill_cache(PerQueueSendState* states, std::chrono::steady_clock::time_point& now) {
@@ -697,9 +668,8 @@ static void do_send_messages() {
     for (size_t i = 0; i < messageQueues.size(); i++) {
         states[i].buff_state           = {-1, 0, 0};
         states[i].next_send            = std::chrono::steady_clock::now();
-        states[i].local                = last_sock_is_local && i == messageQueues.size() - 1;
-        states[i].target_bytes_per_sec = messageQueues[i].bw * (states[i].local ? 1 : 1024 * 1024) / 8;
-        states[i].bytes_per_obj        = states[i].local ? (sizeof(UDPMessageHeader) + MAX_UDP_MESSAGE_LENGTH + sizeof(LOCAL_MAGIC_BYTES)) : PACKET_SIZE;
+        states[i].target_bytes_per_sec = messageQueues[i].bw * 1024 * 1024 / 8;
+        states[i].bytes_per_obj        = PACKET_SIZE;
         states[i].write_objs_per_call  = std::max<size_t>(1, states[i].target_bytes_per_sec / WRITES_PER_SEC / states[i].bytes_per_obj / messageQueues.size());
         states[i].buff_emptied         = true;
     }
@@ -737,44 +707,28 @@ static void do_send_messages() {
             for (; i < send_state.write_objs_per_call + extra_writes && send_state.buff_state.buff_id != -1; i++) {
                 std::tuple<CService, UDPMessage, unsigned int, uint64_t>& msg = buff->messagesPendingRingBuff[send_state.buff_state.nextPendingMessage];
 
-                if (send_state.local) {
-                    assert((std::get<1>(msg).header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_HEADER ||
-                           (std::get<1>(msg).header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_CONTENTS ||
-                           (std::get<1>(msg).header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_TX_CONTENTS);
-                }
-
                 FillChecksum(std::get<3>(msg), std::get<1>(msg), std::get<2>(msg));
 
-                if (send_state.local) {
-                    assert(std::get<2>(msg) == sizeof(UDPMessage) - 1);
-                    int localSock = udp_socks.back();
-                    if (write(localSock, &LOCAL_MAGIC_BYTES, sizeof(LOCAL_MAGIC_BYTES)) != sizeof(LOCAL_MAGIC_BYTES) ||
-                        write(localSock, &std::get<1>(msg), std::get<2>(msg)) != std::get<2>(msg)) {
-                            // TODO: Handle write error (if needed)
-                    }
+                // Set destination address
+                sockaddr_storage ss = {};
+                socklen_t addrlen;
+                if (std::get<0>(msg).IsIPv6()) {
+                    sockaddr_in6* remoteaddr = (sockaddr_in6*)&ss;
+                    remoteaddr->sin6_family = AF_INET6;
+                    assert(std::get<0>(msg).GetIn6Addr(&remoteaddr->sin6_addr));
+                    remoteaddr->sin6_port = htons(std::get<0>(msg).GetPort());
+                    addrlen = sizeof(sockaddr_in6);
                 } else {
+                    sockaddr_in* remoteaddr = (sockaddr_in*)&ss;
+                    remoteaddr->sin_family = AF_INET;
+                    assert(std::get<0>(msg).GetInAddr(&remoteaddr->sin_addr));
+                    remoteaddr->sin_port = htons(std::get<0>(msg).GetPort());
+                    addrlen = sizeof(sockaddr_in);
+                }
 
-                    // Set destination address
-                    sockaddr_storage ss = {};
-                    socklen_t addrlen;
-                    if (std::get<0>(msg).IsIPv6()) {
-                        sockaddr_in6* remoteaddr = (sockaddr_in6*)&ss;
-                        remoteaddr->sin6_family = AF_INET6;
-                        assert(std::get<0>(msg).GetIn6Addr(&remoteaddr->sin6_addr));
-                        remoteaddr->sin6_port = htons(std::get<0>(msg).GetPort());
-                        addrlen = sizeof(sockaddr_in6);
-                    } else {
-                        sockaddr_in* remoteaddr = (sockaddr_in*)&ss;
-                        remoteaddr->sin_family = AF_INET;
-                        assert(std::get<0>(msg).GetInAddr(&remoteaddr->sin_addr));
-                        remoteaddr->sin_port = htons(std::get<0>(msg).GetPort());
-                        addrlen = sizeof(sockaddr_in);
-                    }
-
-                    int sendSock = std::get<0>(msg).IsIPv6() ? udp_socks[group * 2] : udp_socks[group * 2 + 1];
-                    if (sendto(sendSock, &std::get<1>(msg), std::get<2>(msg), 0, (sockaddr*)&ss, addrlen) != std::get<2>(msg)) {
-                        // TODO: Handle send error (e.g. log it)
-                    }
+                int sendSock = std::get<0>(msg).IsIPv6() ? udp_socks[group * 2] : udp_socks[group * 2 + 1];
+                if (sendto(sendSock, &std::get<1>(msg), std::get<2>(msg), 0, (sockaddr*)&ss, addrlen) != std::get<2>(msg)) {
+                    // TODO: Handle send error (e.g. log it)
                 }
 
                 send_state.buff_state.nextPendingMessage = (send_state.buff_state.nextPendingMessage + 1) % PENDING_MESSAGES_BUFF_SIZE;
@@ -804,134 +758,10 @@ static void do_send_messages() {
     }
 }
 
-static void StartLocalBackfillThread() {
-    assert(LOCAL_SEND_GROUP < messageQueues.size());
-    std::thread(&util::TraceThread,
-                "udpbackfill", []() {
-        while (g_node_context->chainman->ActiveChainstate().m_chainman.IsInitialBlockDownload() && !send_messages_break)
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-        const CBlockIndex *lastBlock;
-        CRollingBloomFilter sent_txn_bloom(500000, 0.001); // Hold 500k (~24*6 blocks of txn) txn
-        {
-            LOCK(cs_main);
-            lastBlock = g_node_context->chainman->ActiveTip()->pprev;
-            assert(lastBlock);
-        }
-
-        PerGroupMessageQueue& queue = messageQueues[LOCAL_SEND_GROUP];
-        while (!send_messages_break) {
-            while (!send_messages_break && queue.buffs[2].nextUndefinedMessage.load(std::memory_order_acquire) != queue.buffs[2].nextPendingMessage.load(std::memory_order_acquire))
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            int height;
-            size_t send_txn = 0;
-            {
-                LOCK(cs_main);
-                height = lastBlock->nHeight + 1;
-                const int chain_height = g_node_context->chainman->ActiveHeight();
-                if (height < chain_height - 24 * 6) {
-                    height = chain_height - 24 * 6;
-                } else if (height > chain_height) {
-                    send_txn = 2000;
-                    height = chain_height - 24 * 6;
-                } else if (height > chain_height - 12 * 6)
-                    send_txn = 100;
-                lastBlock = g_node_context->chainman->ActiveChain()[height];
-            }
-
-            if (send_txn) {
-                std::vector<CTransactionRef> txn_to_send;
-                txn_to_send.reserve(send_txn);
-                {
-                    std::set<Txid> txids_to_send;
-                    LOCK(g_node_context->mempool->cs);
-                    for (const auto& iter : g_node_context->mempool->mapTx.get<ancestor_score>()) {
-                        if (txn_to_send.size() >= send_txn)
-                            break;
-                        if (txids_to_send.count(iter.GetTx().GetHash()) || sent_txn_bloom.contains(MakeUCharSpan(iter.GetTx().GetHash())))
-                            continue;
-
-                        std::vector<CTransactionRef> to_add{iter.GetSharedTx()};
-                        while (!to_add.empty()) {
-                            bool has_dep = false;
-                            for (const CTxIn& txin : to_add.back()->vin) {
-                                CTxMemPool::txiter init = g_node_context->mempool->mapTx.find(txin.prevout.hash);
-                                if (init != g_node_context->mempool->mapTx.end() && !txids_to_send.count(txin.prevout.hash)) {
-                                    to_add.emplace_back(init->GetSharedTx());
-                                    has_dep = true;
-                                }
-                            }
-                            if (!has_dep) {
-                                if (txids_to_send.insert(to_add.back()->GetHash()).second) {
-                                    sent_txn_bloom.insert(MakeUCharSpan(to_add.back()->GetHash()));
-                                    txn_to_send.emplace_back(std::move(to_add.back()));
-                                }
-                                to_add.pop_back();
-                            }
-                        }
-                    }
-                }
-                for (const CTransactionRef& tx : txn_to_send) {
-                    std::vector<UDPMessage> msgs;
-                    UDPFillMessagesFromTx(*tx, msgs);
-                    for (UDPMessage& msg : msgs) {
-                        SendMessage(msg, sizeof(UDPMessageHeader) + MAX_UDP_MESSAGE_LENGTH, queue, queue.buffs[2], LOCAL_WRITE_DEVICE_SERVICE, LOCAL_DEVICE_CHECKSUM_MAGIC);
-                    }
-                }
-            }
-
-            LogDebug(BCLog::UDPNET, "UDP: Building backfill block at height %d with hash %s\n", height, lastBlock->phashBlock->ToString());
-
-            CBlock block;
-            assert(g_node_context->chainman->m_blockman.ReadBlock(block, *lastBlock));
-            std::vector<UDPMessage> msgs;
-            UDPFillMessagesFromBlock(block, msgs);
-
-            for (UDPMessage& msg : msgs) {
-                SendMessage(msg, sizeof(UDPMessageHeader) + MAX_UDP_MESSAGE_LENGTH, queue, queue.buffs[2], LOCAL_WRITE_DEVICE_SERVICE, LOCAL_DEVICE_CHECKSUM_MAGIC);
-            }
-        }
-    }).detach();
-}
-
-static std::tuple<int64_t, bool, std::string> get_local_device() {
-    std::string localUDPWriteDevice(gArgs.GetArg("-fecwritedevice", ""));
-
-    if (localUDPWriteDevice == "")
-        return std::make_tuple((int64_t)0, false, std::string());
-
-    size_t bw_end = localUDPWriteDevice.find(',');
-    size_t backfill_end = localUDPWriteDevice.find(',', bw_end + 1);
-
-    if (bw_end == std::string::npos || backfill_end == std::string::npos) {
-        LogPrintf("Failed to parse -fecwritedevice=bw,backfill,file option, not writing\n");
-        return std::make_tuple((int64_t)0, false, std::string());
-    }
-
-    std::string backfill_str(localUDPWriteDevice.substr(bw_end + 1, backfill_end - bw_end - 1));
-    if (backfill_str != "true" && backfill_str != "false") {
-        LogPrintf("-fecwritedevice=bw,backfill,file backfill option must be true or false, not writing\n");
-        return std::make_tuple((int64_t)0, false, std::string());
-    }
-
-    int64_t bw = LocaleIndependentAtoi<int64_t>(localUDPWriteDevice.substr(0, bw_end));
-    bool backfill = backfill_str == "true";
-    localUDPWriteDevice = localUDPWriteDevice.substr(backfill_end + 1);
-
-    return std::make_tuple(bw, backfill, localUDPWriteDevice);
-}
-
-static void send_messages_init(const std::vector<std::pair<unsigned short, uint64_t> >& group_list, const std::tuple<int64_t, bool, std::string>& local_write_device) {
-    messageQueues = std::vector<PerGroupMessageQueue>(group_list.size() + (std::get<0>(local_write_device) ? 1 : 0));
+static void send_messages_init(const std::vector<std::pair<unsigned short, uint64_t> >& group_list) {
+    messageQueues = std::vector<PerGroupMessageQueue>(group_list.size());
     for (size_t i = 0; i < group_list.size(); i++)
         messageQueues[i].bw = group_list[i].second;
-    if (std::get<0>(local_write_device)) {
-        LOCAL_SEND_GROUP = group_list.size();
-        messageQueues[LOCAL_SEND_GROUP].bw = std::get<0>(local_write_device);
-        last_sock_is_local = true;
-    } else {
-        last_sock_is_local = false;
-    }
 }
 
 static void send_messages_flush_and_break() {
@@ -1019,13 +849,11 @@ static void OpenUDPConnectionTo(const CService& addr, const UDPConnectionInfo& i
     if (info.connection_type != UDP_CONNECTION_TYPE_INBOUND_ONLY)
         maybe_have_write_nodes = true;
 
-    bool fIsLocal = (addr == LOCAL_WRITE_DEVICE_SERVICE);
-
     LogDebug(BCLog::UDPNET, "UDP: Initializing connection to %s...\n", addr.ToStringAddrPort());
 
     UDPConnectionState& state = res.first->second;
     state.connection = info;
-    state.state = fIsLocal ? STATE_INIT_COMPLETE : STATE_INIT;
+    state.state = STATE_INIT;
     state.lastSendTime = 0;
     state.lastRecvTime = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
 
@@ -1034,12 +862,6 @@ static void OpenUDPConnectionTo(const CService& addr, const UDPConnectionInfo& i
         if (it.second.connection.group == info.group)
             group_count++;
     min_per_node_mbps = std::min(min_per_node_mbps.load(), messageQueues[info.group].bw / group_count);
-
-    if (fIsLocal) {
-        for (size_t i = 0; i < sizeof(state.last_pings) / sizeof(double); i++) {
-            state.last_pings[i] = 0;
-        }
-    }
 }
 
 void OpenUDPConnectionTo(const CService& addr, uint64_t local_magic, uint64_t remote_magic, bool fUltimatelyTrusted, UDPConnectionType connection_type, size_t group) {
@@ -1073,9 +895,4 @@ void CloseUDPConnectionTo(const CService& addr) {
     if (it2 == mapUDPNodes.end())
         return;
     DisconnectNode(it2);
-}
-
-static void OpenLocalDeviceConnection() {
-    OpenPersistentUDPConnectionTo(LOCAL_WRITE_DEVICE_SERVICE, LOCAL_DEVICE_CHECKSUM_MAGIC, LOCAL_DEVICE_CHECKSUM_MAGIC, false,
-            UDP_CONNECTION_TYPE_OUTBOUND_ONLY, LOCAL_SEND_GROUP);
 }
