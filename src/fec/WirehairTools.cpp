@@ -27,7 +27,7 @@
     POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include "WirehairTools.h"
+#include <fec/WirehairTools.h>
 
 #include <cmath>
 #include <cstdlib>

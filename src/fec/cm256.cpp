@@ -26,7 +26,7 @@
 	POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include "cm256.h"
+#include <fec/cm256.h>
 
 
 /*

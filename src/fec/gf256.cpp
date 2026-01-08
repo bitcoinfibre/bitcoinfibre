@@ -27,7 +27,7 @@
     POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include "gf256.h"
+#include <fec/gf256.h>
 
 #if defined(LINUX_ARM) && defined(__linux__)
 #include <unistd.h>
