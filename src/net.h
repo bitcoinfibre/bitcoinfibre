@@ -77,6 +77,7 @@ inline constexpr int MAX_FEELER_CONNECTIONS = 1;
 inline constexpr size_t MAX_PRIVATE_BROADCAST_CONNECTIONS{64};
 /** -listen default */
 inline constexpr bool DEFAULT_LISTEN = true;
+inline constexpr bool DEFAULT_ADVERTISE_LOCAL{true};
 /** The maximum number of peer connections to maintain. */
 inline constexpr unsigned int DEFAULT_MAX_PEER_CONNECTIONS{200};
 /** Default percentage of inbound connection slots that tx-relaying peers can use */
@@ -175,6 +176,7 @@ CService GetLocalAddress(const CNode& peer);
 
 extern bool fDiscover;
 extern bool fListen;
+extern bool fAdvertiseLocal;
 
 /** Subversion as sent to the P2P network in `version` messages */
 extern std::string strSubVersion;
