@@ -276,7 +276,7 @@ void UDPRelayBlock(const CBlock& block) {
             // We unlock everything here to let the net thread relay packets,
             // but continue to use data which is theoretically under the locks.
             // This is OK - we get a copy of the shared_ptr and hold it in
-            // partial_block_ptr so it wont be destroyed out from under us, and
+            // partial_block_ptr so it won't be destroyed out from under us, and
             // are only using the chunks from PartiallyDownloadedChunkBlock and
             // the decoder, both of which, once available, will never become
             // un-available or be modified by any other thread (due to the
@@ -769,7 +769,7 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
 
                     std::lock_guard<std::recursive_mutex> udpNodesLock(cs_mapUDPNodes);
                     setBlocksReceived.insert(process_block.first);
-                    RemovePartialBlocks(process_block.first.first); // Ensure we remove even if we didnt UDPRelayBlock()
+                    RemovePartialBlocks(process_block.first.first); // Ensure we remove even if we didn't UDPRelayBlock()
                 }
             } else if (!block.in_header && block.initialized) {
                 uint32_t mempool_provided_chunks = 0;
@@ -1063,7 +1063,7 @@ bool HandleBlockTxMessage(UDPMessage& msg, size_t length, const CService& node, 
         // Thus, while the block is processing in ProcessNewBlockThread, we
         // continue forwarding chunks we received from trusted peers
         // Note that we will also drop block body packets here while processing
-        // the header, sadly isnt much we can do about that (unless we were to
+        // the header, sadly isn't much we can do about that (unless we were to
         // queue them, but most of the packets we'll drop here are header FEC
         // anyway, so not much use in doing so).
         if (state.connection.fTrusted) {
@@ -1107,7 +1107,7 @@ bool HandleBlockTxMessage(UDPMessage& msg, size_t length, const CService& node, 
     }
     if ((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_CONTENTS && block.in_header) {
         // Either we're getting packets out of order and wasting this packet,
-        // or we didnt get enough header and will fail download anyway
+        // or we didn't get enough header and will fail download anyway
         return true;
     }
 

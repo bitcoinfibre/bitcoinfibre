@@ -68,7 +68,7 @@ static const uint8_t kSquareRootTable[256] = {
 
         "Contributors include Arne Steinarson for the basic approximation idea, 
         Dann Corbit and Mathew Hendry for the first cut at the algorithm, 
-        Lawrence Kirby for the rearrangement, improvments and range optimization
+        Lawrence Kirby for the rearrangement, improvements and range optimization
         and Paul Hsieh for the round-then-adjust idea."
 
     I tried this out, stdlib sqrt() and a few variations on Newton-Raphson

@@ -443,7 +443,7 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg) {
 
         state.protocolVersion = le64toh_internal(msg.msg.longint);
         if (PROTOCOL_VERSION_MIN(state.protocolVersion) > PROTOCOL_VERSION_CUR(UDP_PROTOCOL_VERSION)) {
-            LogInfo("UDP: Got min protocol version we didnt understand (%u:%u) from %s\n", PROTOCOL_VERSION_MIN(state.protocolVersion), PROTOCOL_VERSION_CUR(state.protocolVersion), it->first.ToStringAddrPort());
+            LogInfo("UDP: Got min protocol version we didn't understand (%u:%u) from %s\n", PROTOCOL_VERSION_MIN(state.protocolVersion), PROTOCOL_VERSION_CUR(state.protocolVersion), it->first.ToStringAddrPort());
             send_and_disconnect(it);
             return;
         }
