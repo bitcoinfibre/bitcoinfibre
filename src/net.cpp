@@ -116,6 +116,7 @@ static const uint64_t RANDOMIZER_ID_NETWORKKEY = 0x0e8a2b136c592a7dULL; // SHA25
 //
 bool fDiscover = true;
 bool fListen = true;
+bool fAdvertiseLocal{DEFAULT_ADVERTISE_LOCAL};
 GlobalMutex g_maplocalhost_mutex;
 std::map<CNetAddr, LocalServiceInfo> mapLocalHost GUARDED_BY(g_maplocalhost_mutex);
 std::string strSubVersion;
