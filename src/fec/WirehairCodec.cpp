@@ -2989,7 +2989,7 @@ WirehairResult Codec::ResumeSolveMatrix(
             if (ge_row_k >= first_heavy_row &&
                 ge_row_k < (first_heavy_row + _extra_count))
             {
-                // Re-use it
+                // Reuse it
                 new_pivot_i = (uint16_t)pivot_i;
                 break;
             }
