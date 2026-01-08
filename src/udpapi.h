@@ -39,4 +39,4 @@ void GetUDPConnectionList(std::vector<UDPConnectionStats>& connections_list);
 
 void UDPRelayBlock(const CBlock& block);
 
-#endif
+#endif // BITCOIN_UDPAPI_H
