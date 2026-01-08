@@ -816,7 +816,7 @@ static void do_send_messages() {
 
     static const size_t WRITES_PER_SEC = 1000;
 
-    PerQueueSendState* states = (PerQueueSendState*)alloca(sizeof(PerQueueSendState) * messageQueues.size());
+    std::vector<PerQueueSendState> states(messageQueues.size());
     for (size_t i = 0; i < messageQueues.size(); i++) {
         states[i].buff_state           = {-1, 0, 0};
         states[i].next_send            = std::chrono::steady_clock::now();
@@ -918,10 +918,10 @@ static void do_send_messages() {
 
         std::chrono::steady_clock::time_point end(std::chrono::steady_clock::now());
         if (sleep_until > end) { // No need to be aggressive here, fill_cache is useful to speed up per-queue loop anyway
-            if (fill_cache(states, end))
+            if (fill_cache(states.data(), end))
                 continue;
             std::unique_lock<std::mutex> lock(send_messages_mutex);
-            if (!fill_cache(states, end))
+            if (!fill_cache(states.data(), end))
                 send_messages_wake_cv.wait_until(lock, sleep_until);
         }
     }
