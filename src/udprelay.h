@@ -21,4 +21,4 @@ void ProcessDownloadTimerEvents();
 void UDPFillMessagesFromBlock(const CBlock& block, std::vector<UDPMessage>& msgs);
 void UDPFillMessagesFromTx(const CTransaction& tx, std::vector<UDPMessage>& msgs);
 
-#endif
+#endif // BITCOIN_UDPRELAY_H

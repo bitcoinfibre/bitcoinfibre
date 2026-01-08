@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_UDPINFO_H
-#define BITCOIN_UDPINFO_H
+#ifndef BITCOIN_FIBRERACE_H
+#define BITCOIN_FIBRERACE_H
 
 #include <uint256.h>
 
@@ -44,4 +44,4 @@ public:
     ~FibreBlockRaceConnectContextGuard() { FibreBlockRaceClearConnectContext(); }
 };
 
-#endif // BITCOIN_UDPINFO_H
+#endif // BITCOIN_FIBRERACE_H
