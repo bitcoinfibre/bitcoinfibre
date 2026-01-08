@@ -77,6 +77,8 @@ static const int MAX_FEELER_CONNECTIONS = 1;
 static constexpr size_t MAX_PRIVATE_BROADCAST_CONNECTIONS{64};
 /** -listen default */
 static const bool DEFAULT_LISTEN = true;
+/** -advertiselocal default */
+static const bool DEFAULT_ADVERTISE_LOCAL = true;
 /** The maximum number of peer connections to maintain. */
 static const unsigned int DEFAULT_MAX_PEER_CONNECTIONS = 125;
 /** The default for -maxuploadtarget. 0 = Unlimited */
@@ -173,6 +175,7 @@ CService GetLocalAddress(const CNode& peer);
 
 extern bool fDiscover;
 extern bool fListen;
+extern bool fAdvertiseLocal;
 
 /** Subversion as sent to the P2P network in `version` messages */
 extern std::string strSubVersion;
