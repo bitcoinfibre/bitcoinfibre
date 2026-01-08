@@ -592,8 +592,8 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                 if (fBench)
                     header_deserialized = std::chrono::steady_clock::now();
 
-                    auto extra_txn = peer_manager->GetExtraTxnForCompact();
-                    ReadStatus decode_status = block.ProvideHeaderData(header, *extra_txn);
+                auto extra_txn = peer_manager->GetExtraTxnForCompact();
+                ReadStatus decode_status = block.ProvideHeaderData(header, *extra_txn);
                 if (decode_status != READ_STATUS_OK) {
                     lock.unlock();
                     std::lock_guard<std::recursive_mutex> udpNodesLock(cs_mapUDPNodes);
