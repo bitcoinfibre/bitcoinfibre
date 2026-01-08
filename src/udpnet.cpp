@@ -7,7 +7,6 @@
 #include <udpapi.h>
 #include <udprelay.h>
 
-#include <bitcoin-build-config.h>
 #include <chainparams.h>
 #include <common/args.h>
 #include <common/bloom.h>
@@ -30,7 +29,6 @@
 
 #include <span.h>
 #include <sys/ioctl.h>
-#include <sys/socket.h>
 
 #include <event2/event.h>
 
@@ -406,7 +404,7 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg) {
     sockaddr_storage remote_addr;
     socklen_t remote_addr_len = sizeof(remote_addr);
     ssize_t res = recvfrom(fd, &msg, sizeof(msg), MSG_DONTWAIT, (sockaddr*)&remote_addr, &remote_addr_len);
-     
+
     if (res < 0) {
         int err = errno;
         LogPrintf("UDP: Error reading from socket: %d (%s)!\n", err, NetworkErrorString(err));
