@@ -5540,7 +5540,7 @@ void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::micros
 
     LOCK(peer.m_addr_send_times_mutex);
     // Periodically advertise our local address to the peer.
-    if (fListen && !m_chainman.IsInitialBlockDownload() &&
+    if (fListen && fAdvertiseLocal && !m_chainman.IsInitialBlockDownload() &&
         peer.m_next_local_addr_send < current_time) {
         // If we've sent before, clear the bloom filter for the peer, so that our
         // self-announcement will actually go out.
