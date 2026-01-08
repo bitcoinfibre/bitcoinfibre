@@ -177,15 +177,10 @@ static void SendFECData(UDPMessage& msg, DataFECer& fec, const size_t high_prio_
     }
 }
 
-static inline void FillCommonMessageHeader(UDPMessage& msg, const uint64_t hash_prefix, uint8_t type, const std::vector<unsigned char>& data) {
-    msg.header.msg_type        = type;
+static inline void FillBlockMessageHeader(UDPMessage& msg, const uint64_t hash_prefix, UDPMessageType type, const std::vector<unsigned char>& data) {
+    msg.header.msg_type        = static_cast<uint8_t>(type) | static_cast<uint8_t>(HAVE_BLOCK);
     msg.msg.block.hash_prefix  = htole64_internal(hash_prefix);
     msg.msg.block.obj_length   = htole32_internal(data.size());
-}
-
-static inline void FillBlockMessageHeader(UDPMessage& msg, const uint64_t hash_prefix, UDPMessageType type, const std::vector<unsigned char>& data) {
-    // First fill in common message elements
-    FillCommonMessageHeader(msg, hash_prefix, static_cast<uint8_t>(type) | static_cast<uint8_t>(HAVE_BLOCK), data);
 }
 
 static void SendFECedData(const uint256& blockhash, UDPMessageType type, const std::vector<unsigned char>& data, DataFECer& fec) {
@@ -400,88 +395,6 @@ void UDPRelayBlock(const CBlock& block) {
 
     setBlocksRelayed.insert(hash_prefix);
     RemovePartialBlocks(hash_prefix);
-}
-
-void UDPFillMessagesFromTx(const CTransaction& tx, std::vector<UDPMessage>& msgs) {
-    const Wtxid hash(tx.GetWitnessHash());
-    const uint64_t hash_prefix = hash.ToUint256().GetUint64(0);
-
-    std::vector<unsigned char> data;
-    VectorOutputStream stream(&data);
-    stream << TX_WITH_WITNESS(tx);
-
-    const size_t data_chunks = DIV_CEIL(data.size(), FEC_CHUNK_SIZE);
-    DataFECer fecer(data, data_chunks * 1.2 + 1);
-
-    msgs.resize(data_chunks + fecer.fec_chunks);
-    for (size_t i = 0; i < data_chunks; i++) {
-        FillCommonMessageHeader(msgs[i], hash_prefix, MSG_TYPE_TX_CONTENTS, data);
-        CopyMessageData(msgs[i], data, data_chunks, i);
-    }
-    for (size_t i = 0; i < fecer.fec_chunks; i++) {
-        FillCommonMessageHeader(msgs[i + data_chunks], hash_prefix, MSG_TYPE_TX_CONTENTS, data);
-        CopyFECData(msgs[i + data_chunks], fecer, i);
-    }
-}
-
-void UDPFillMessagesFromBlock(const CBlock& block, std::vector<UDPMessage>& msgs) {
-    const uint256 hashBlock(block.GetHash());
-    const uint64_t hash_prefix = hashBlock.GetUint64(0);
-
-    CBlockHeaderAndLengthShortTxIDs headerAndIDs(block, true);
-
-    std::vector<unsigned char> data;
-    data.reserve(2500 + 8 * block.vtx.size()); // Rather conservatively high estimate
-    VectorOutputStream stream(&data);
-    stream << headerAndIDs;
-
-    const size_t header_data_chunks = DIV_CEIL(data.size(), FEC_CHUNK_SIZE);
-    DataFECer header_fecer(data, std::max(size_t(30), header_data_chunks * 2 + 8)); // Generate enough to recover header 3 times
-    const size_t send_window = header_fecer.fec_chunks / 2;
-
-    msgs.resize(header_data_chunks + header_fecer.fec_chunks);
-    for (size_t i = 0; i < header_data_chunks; i++) {
-        FillBlockMessageHeader(msgs[i], hash_prefix, MSG_TYPE_BLOCK_HEADER, data);
-        CopyMessageData(msgs[i], data, header_data_chunks, i);
-    }
-    size_t offset = header_data_chunks;
-    for (size_t i = 0; i < send_window; i++) {
-        FillBlockMessageHeader(msgs[i + offset], hash_prefix, MSG_TYPE_BLOCK_HEADER, data);
-        CopyFECData(msgs[i + offset], header_fecer, i);
-    }
-    offset += send_window;
-
-    ChunkCodedBlock codedBlock(block, headerAndIDs);
-    const std::vector<unsigned char>& block_chunks = codedBlock.GetCodedBlock();
-
-    size_t data_data_chunks = DIV_CEIL(block_chunks.size(), FEC_CHUNK_SIZE);
-    size_t data_fec_chunks = data_data_chunks + 10; //TODO: Pick something different?
-
-    msgs.resize(msgs.size() + data_data_chunks + data_fec_chunks);
-
-    for (size_t i = 0; i < send_window && i < data_data_chunks; i++) {
-        FillBlockMessageHeader(msgs[i + offset], hash_prefix, MSG_TYPE_BLOCK_CONTENTS, block_chunks);
-        CopyMessageData(msgs[i + offset], block_chunks, data_data_chunks, i);
-    }
-    offset += std::min(send_window, data_data_chunks);
-
-    for (size_t i = send_window; i < header_fecer.fec_chunks; i++) {
-        FillBlockMessageHeader(msgs[i - send_window + offset], hash_prefix, MSG_TYPE_BLOCK_HEADER, data);
-        CopyFECData(msgs[i - send_window + offset], header_fecer, i);
-    }
-    offset += header_fecer.fec_chunks - send_window; // fec_chunks is divisible by 2, so this is fine
-
-    for (size_t i = send_window; i < data_data_chunks; i++) {
-        FillBlockMessageHeader(msgs[i - send_window + offset], hash_prefix, MSG_TYPE_BLOCK_CONTENTS, block_chunks);
-        CopyMessageData(msgs[i - send_window + offset], block_chunks, data_data_chunks, i);
-    }
-    offset += (size_t)std::max(int64_t(0), int64_t(data_data_chunks) - int64_t(send_window));
-
-    DataFECer block_fecer(block_chunks, data_fec_chunks);
-    for (size_t i = 0; i < block_fecer.fec_chunks; i++) {
-        FillBlockMessageHeader(msgs[i + offset], hash_prefix, MSG_TYPE_BLOCK_CONTENTS, block_chunks);
-        CopyFECData(msgs[i + offset], block_fecer, i);
-    }
 }
 
 static std::mutex block_process_mutex;
@@ -726,7 +639,7 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                         if (have_prev) {
                             setBlocksReceived.insert(process_block.first);
                         } else {
-                            // Allow re-downloading again later, useful for local backfill downloads
+                            // Allow downloading the block again after its parent arrives.
                             setBlocksReceived.erase(process_block.first);
                         }
                         RemovePartialBlock(process_block.first);

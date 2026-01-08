@@ -22,9 +22,6 @@
 // This is largely the API between udpnet and udprelay, see udpapi for the
 // external-facing API
 
-// Local stuff only uses magic, net stuff only uses protocol_version,
-// so both need to be changed any time wire format changes
-static const unsigned char LOCAL_MAGIC_BYTES[] = { 0xab, 0xad, 0xca, 0xfe };
 // SYN carries a little-endian 64-bit value: bits 0-15 contain the current
 // version and bits 16-31 the minimum version. Bits 32-63 are sent as zero
 // and ignored on receipt, matching the archive protocol.
@@ -38,7 +35,7 @@ enum UDPMessageType {
     MSG_TYPE_BLOCK_CONTENTS = 4,
     MSG_TYPE_PING = 5,
     MSG_TYPE_PONG = 6,
-    MSG_TYPE_TX_CONTENTS = 7,
+    MSG_TYPE_TX_CONTENTS = 7, // Reserved; transaction messages are rejected.
 };
 
 static const uint8_t UDP_MSG_TYPE_TYPE_MASK = 0b00111111;
@@ -58,12 +55,10 @@ enum UDPBlockMessageFlags { // Put in the msg_type
     HAVE_BLOCK = (1 << 6),
 };
 
-struct __attribute__((packed)) UDPBlockMessage { // (also used for txn)
+struct __attribute__((packed)) UDPBlockMessage {
     /**
      * First 8 bytes of blockhash, interpreted in LE (note that this will not include 0s, those are at the end).
-     * For txn, first 8 bytes of tx, though this should change in the future.
-     * Neither block nor tx recv-side logic cares what this is as long as it mostly-uniquely identifies the
-     * object being sent!
+     * Identifies the block whose header or contents are being sent.
      */
     uint64_t hash_prefix;
     uint32_t obj_length; // Size of full FEC-coded data
