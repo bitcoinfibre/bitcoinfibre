@@ -27,7 +27,7 @@
     POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include "WirehairCodec.h"
+#include <fec/WirehairCodec.h>
 
 
 //------------------------------------------------------------------------------

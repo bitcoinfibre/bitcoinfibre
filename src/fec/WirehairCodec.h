@@ -208,7 +208,7 @@
     original data is recovered.
 */
 
-#include "WirehairTools.h"
+#include <fec/WirehairTools.h>
 
 namespace wirehair {
 
