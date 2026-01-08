@@ -840,7 +840,7 @@ class Codec
     */
 
     /// Multiply dense rows by peeling matrix to generate GE rows,
-    /// but no row values are involed yet
+    /// but no row values are involved yet
     void MultiplyDenseRows();
 
     /** \page O(1) Heavy Row Structure
