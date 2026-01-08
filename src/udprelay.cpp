@@ -6,7 +6,6 @@
 
 #include <blockencodings.h>
 #include <consensus/consensus.h>  // for MAX_BLOCK_SERIALIZED_SIZE
-#include <consensus/validation.h> // for BlockValidationState/TxValidationState
 #include <logging.h>
 #include <net_processing.h>
 #include <streams.h>
@@ -876,64 +875,7 @@ static void BlockMsgHToLE(UDPMessage& msg) {
     msg.msg.block.chunk_id    = htole32_internal(msg.msg.block.chunk_id);
 }
 
-static bool HandleTx(UDPMessage& msg, size_t length, const CService& node, UDPConnectionState& state, const node::NodeContext* const node_context) {
-    if (msg.msg.block.obj_length > 400000) {
-        LogInfo("UDP: Got massive tx obj_length of %u\n", msg.msg.block.obj_length);
-        return false;
-    }
-
-    if (state.tx_in_flight_hash_prefix != msg.msg.block.hash_prefix) {
-        state.tx_in_flight_hash_prefix = msg.msg.block.hash_prefix;
-        state.tx_in_flight_msg_size    = msg.msg.block.obj_length;
-        state.tx_in_flight.reset(new FECDecoder(msg.msg.block.obj_length));
-    }
-
-    if (!state.tx_in_flight) return true; // Already finished decode
-
-    if (state.tx_in_flight_msg_size != msg.msg.block.obj_length) {
-        LogInfo("UDP: Got inconsistent object length for tx %lu\n", msg.msg.block.hash_prefix);
-        return true;
-    }
-
-    assert(!state.tx_in_flight->DecodeReady());
-
-    if (!state.tx_in_flight->ProvideChunk(msg.msg.block.data, msg.msg.block.chunk_id)) {
-        // Bad chunk id, maybe FEC is upset? Don't disconnect in case it can be random
-        LogInfo("UDP: FEC chunk decode failed for chunk %d from tx %lu from %s\n", msg.msg.block.chunk_id, msg.msg.block.hash_prefix, node.ToStringAddrPort());
-        return true;
-    }
-
-    if (state.tx_in_flight->DecodeReady()) {
-        std::vector<unsigned char> tx_data(msg.msg.block.obj_length);
-
-        for (size_t i = 0; i < DIV_CEIL(tx_data.size(), FEC_CHUNK_SIZE); i++) {
-            const void* chunk = state.tx_in_flight->GetDataPtr(i);
-            assert(chunk);
-            memcpy(tx_data.data() + i * FEC_CHUNK_SIZE, chunk, std::min(tx_data.size() - i * FEC_CHUNK_SIZE, (size_t)FEC_CHUNK_SIZE));
-        }
-
-        try {
-            VectorInputStream stream(&tx_data);
-            CTransactionRef tx;
-            stream >>  TX_WITH_WITNESS(tx);
-            LOCK(cs_main);
-            TxValidationState state;
-            const MempoolAcceptResult result = AcceptToMemoryPool(node_context->chainman->ActiveChainstate(), tx, GetTime(), /*bypass_limits=*/false, /*test_accept=*/false);
-            if (result.m_result_type == MempoolAcceptResult::ResultType::VALID) {
-                node_context->peerman->InitiateTxBroadcastToAll(tx->GetHash(), tx->GetWitnessHash());
-            }
-        } catch (std::ios_base::failure& e) {
-            LogInfo("UDP: Tx decode failed for tx %lu from %s\n", msg.msg.block.hash_prefix, node.ToStringAddrPort());
-            return true;
-        }
-
-        state.tx_in_flight.reset();
-    }
-
-    return true;
-}
-
-bool HandleBlockTxMessage(UDPMessage& msg, size_t length, const CService& node, UDPConnectionState& state, const std::chrono::steady_clock::time_point& packet_process_start, const node::NodeContext* const node_context) {
+bool HandleBlockMessage(UDPMessage& msg, size_t length, const CService& node, UDPConnectionState& state, const std::chrono::steady_clock::time_point& packet_process_start, const node::NodeContext* const node_context) {
     //TODO: There are way too many damn tree lookups here...either cut them down or increase parallelism
     const bool fBench = LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug);
     const bool trace_active = TRACEPOINT_ACTIVE(udp, block_header_chunk);
@@ -942,7 +884,7 @@ bool HandleBlockTxMessage(UDPMessage& msg, size_t length, const CService& node, 
     if (collect_timing)
         start = std::chrono::steady_clock::now();
 
-    assert((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_HEADER || (msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_CONTENTS || (msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_TX_CONTENTS);
+    assert((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_HEADER || (msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_BLOCK_CONTENTS);
 
     if (length != sizeof(UDPMessageHeader) + sizeof(UDPBlockMessage)) {
         LogInfo("UDP: Got invalidly-sized block message from %s\n", node.ToStringAddrPort());
@@ -952,9 +894,6 @@ bool HandleBlockTxMessage(UDPMessage& msg, size_t length, const CService& node, 
     msg.msg.block.hash_prefix = le64toh_internal(msg.msg.block.hash_prefix);
     msg.msg.block.obj_length  = le32toh_internal(msg.msg.block.obj_length);
     msg.msg.block.chunk_id    = le32toh_internal(msg.msg.block.chunk_id);
-
-    if ((msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK) == MSG_TYPE_TX_CONTENTS)
-        return HandleTx(msg, length, node, state, node_context);
 
     const uint64_t hash_prefix = msg.msg.block.hash_prefix; // Need a reference in a few places, but its packed, so we can't have one directly
     const std::pair<uint64_t, CService> hash_peer_pair = std::make_pair(hash_prefix, state.connection.fTrusted ? TRUSTED_PEER_DUMMY : node);
