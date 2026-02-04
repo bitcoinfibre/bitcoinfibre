@@ -1676,10 +1676,10 @@ ServiceFlags PeerManagerImpl::GetDesirableServiceFlags(ServiceFlags services) co
     if (services & NODE_NETWORK_LIMITED) {
         // Limited peers are desirable when we are close to the tip.
         if (ApproximateBestBlockDepth() < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS) {
-            return ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
+            return ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS | NODE_P2P_V2);
         }
     }
-    return ServiceFlags(NODE_NETWORK | NODE_WITNESS);
+    return ServiceFlags(NODE_NETWORK | NODE_WITNESS | NODE_P2P_V2);
 }
 
 PeerRef PeerManagerImpl::GetPeerRef(NodeId id) const
@@ -3665,6 +3665,13 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // Feeler connections exist only to verify if address is online.
         if (pfrom.IsFeelerConn()) {
             LogDebug(BCLog::NET, "feeler connection completed, %s\n", pfrom.DisconnectMsg(fLogIPs));
+            pfrom.fDisconnect = true;
+        }
+        if ((nServices & NODE_P2P_V2) && (pfrom.m_transport->GetInfo().transport_type == TransportProtocolType::V1)) {
+            LogDebug(BCLog::NET, "claims to support transport v2 but connected with v1 peer=%d; disconnecting\n", pfrom.GetId());
+            pfrom.fDisconnect = true;
+        } else if ((pfrom.m_transport->GetInfo().transport_type == TransportProtocolType::V1)) {
+            LogDebug(BCLog::NET, "v1 peer=%d; disconnecting\n", pfrom.GetId());
             pfrom.fDisconnect = true;
         }
         return;
