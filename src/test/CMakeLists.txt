@@ -117,6 +117,7 @@ add_executable(test_bitcoin
   txrequest_tests.cpp
   txvalidation_tests.cpp
   txvalidationcache_tests.cpp
+  udpnet_tests.cpp
   uint256_tests.cpp
   util_check_tests.cpp
   util_expected_tests.cpp
