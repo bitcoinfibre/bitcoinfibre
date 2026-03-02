@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chain.h>
 #include <mutex>
+#include <serialize.h>
 #include <stdint.h>
 #include <vector>
 
@@ -201,5 +202,41 @@ extern bool maybe_have_write_nodes;
 void SendMessage(const UDPMessage& msg, const unsigned int length, bool high_prio, const CService& service, const uint64_t magic, size_t group);
 void SendMessage(const UDPMessage& msg, const unsigned int length, bool high_prio, const std::map<CService, UDPConnectionState>::const_iterator& node);
 void DisconnectNode(const std::map<CService, UDPConnectionState>::iterator& it);
+
+/**
+ * One persistent UDP peer as stored on disk (udppeers.dat).
+ *
+ * Fields use serialization-safe types:
+ *   - addr_str is the CService address as "ip:port" (from ToStringAddrPort()).
+ *     We avoid serializing CService directly because its Unserialize() calls
+ *     s.GetParams<SerParams>() to select V1/V2 encoding, and raw AutoFile /
+ *     HashVerifier streams do not carry params. Storing a plain string sidesteps
+ *     this entirely; Lookup() reconstructs the CService on load.
+ *   - local_magic / remote_magic are in HOST byte order here; the
+ *     serialization framework writes them as little-endian. UDPConnectionInfo
+ *     stores them pre-converted to LE - convert with le64toh_internal /
+ *     htole64_internal when moving between the two representations.
+ *   - group uses uint32_t (not size_t) to keep the file format identical on
+ *     32-bit and 64-bit platforms.
+ *   - connection_type is stored as uint8_t to give the enum a stable size.
+ */
+struct UDPPeerEntry {
+    std::string addr_str;      // CService::ToStringAddrPort(), e.g. "1.2.3.4:8444"
+    uint64_t    local_magic;   // host byte order
+    uint64_t    remote_magic;  // host byte order
+    uint32_t    group;
+    bool        fTrusted;
+    uint8_t     connection_type; // UDPConnectionType cast to uint8_t
+
+    SERIALIZE_METHODS(UDPPeerEntry, obj)
+    {
+        READWRITE(obj.addr_str,
+                  obj.local_magic,
+                  obj.remote_magic,
+                  obj.group,
+                  obj.fTrusted,
+                  obj.connection_type);
+    }
+};
 
 #endif

@@ -308,6 +308,7 @@ void Shutdown(NodeContext& node)
         }
     }
     StopMapPort();
+    DumpUDPPeers(node.args->GetDataDirNet() / UDP_PEERS_FILENAME);
     StopUDPConnections();
 
     // Because these depend on each-other, we make sure that neither can be
@@ -2208,6 +2209,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (GetUDPInboundPorts().size() || gArgs.GetArg("-fecwritedevice", "") != "" || gArgs.GetArg("-fecreaddevice", "") != "") {
         if (!InitializeUDPConnections(&node))
             return InitError(_("Failed to check the UDP listen port - is something else already bound to this port?"));
+        LoadUDPPeers(args.GetDataDirNet() / UDP_PEERS_FILENAME);
     }
 
     // ********************************************************* Step 13: finished

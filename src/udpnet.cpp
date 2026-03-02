@@ -28,6 +28,12 @@
 #include <util/time.h>
 #include <validation.h>
 
+#include <random.h>
+#include <streams.h>
+#include <tinyformat.h>
+#include <util/fs.h>
+#include <util/fs_helpers.h>
+
 #include <span.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -74,6 +80,8 @@ bool maybe_have_write_nodes;
 
 static std::map<int64_t, std::tuple<CService, uint64_t, size_t> > nodesToRepeatDisconnect;
 static std::map<CService, UDPConnectionInfo> mapPersistentNodes;
+
+const char* const UDP_PEERS_FILENAME = "udppeers.dat";
 
 static node::NodeContext* g_node_context; // Initialized by InitializeUDPConnections
 
@@ -1253,6 +1261,123 @@ void CloseUDPConnectionTo(const CService& addr) {
     if (it2 == mapUDPNodes.end())
         return;
     DisconnectNode(it2);
+}
+
+void DumpUDPPeers(const fs::path& peers_db_path)
+{
+    std::vector<UDPPeerEntry> peers;
+    {
+        std::unique_lock<std::recursive_mutex> lock(cs_mapUDPNodes);
+        peers.reserve(mapPersistentNodes.size());
+        for (const auto& [addr, info] : mapPersistentNodes) {
+            UDPPeerEntry e;
+            e.addr_str        = addr.ToStringAddrPort();
+            e.local_magic     = le64toh_internal(info.local_magic);   // stored LE → host order
+            e.remote_magic    = le64toh_internal(info.remote_magic);  // stored LE → host order
+            e.group           = static_cast<uint32_t>(info.group);
+            e.fTrusted        = info.fTrusted;
+            e.connection_type = static_cast<uint8_t>(info.connection_type);
+            peers.push_back(e);
+        }
+    }
+
+    LogInfo("Flushing %d UDP peer(s) to %s\n",
+            peers.size(), fs::PathToString(peers_db_path.filename()));
+
+    const uint16_t randv{FastRandomContext().rand<uint16_t>()};
+    const fs::path parentDir{peers_db_path.parent_path()};  // explicit fs::path to avoid std::filesystem::path / fs::path ambiguity
+    fs::path pathTmp = parentDir / fs::u8path(strprintf("udppeers.%04x", randv));
+
+    FILE* file = fsbridge::fopen(pathTmp, "wb");
+    AutoFile fileout{file};
+    if (fileout.IsNull()) {
+        LogError("%s: Failed to open temp file %s\n",
+                 __func__, fs::PathToString(pathTmp));
+        return;
+    }
+
+    try {
+        HashedSourceWriter hashwriter{fileout};
+        hashwriter << Params().MessageStart() << peers;
+        fileout << hashwriter.GetHash();
+    } catch (const std::exception& e) {
+        LogError("%s: Serialize or I/O error: %s\n", __func__, e.what());
+        (void)fileout.fclose();
+        fs::remove(pathTmp);
+        return;
+    }
+
+    if (!fileout.Commit()) {
+        LogError("%s: Failed to flush %s\n", __func__, fs::PathToString(pathTmp));
+        (void)fileout.fclose();
+        fs::remove(pathTmp);
+        return;
+    }
+    (void)fileout.fclose();
+
+    if (!RenameOver(pathTmp, peers_db_path)) {
+        fs::remove(pathTmp);
+        LogError("%s: Rename-into-place failed for %s\n",
+                 __func__, fs::PathToString(peers_db_path));
+    }
+}
+
+void LoadUDPPeers(const fs::path& peers_db_path)
+{
+    std::vector<UDPPeerEntry> peers;
+
+    FILE* file = fsbridge::fopen(peers_db_path, "rb");
+    AutoFile filein{file};
+    if (filein.IsNull()) {
+        return; // Normal on first run, no file yet.
+    }
+
+    try {
+        HashVerifier verifier{filein};
+        MessageStartChars msgStart;
+        verifier >> msgStart;
+        if (msgStart != Params().MessageStart()) {
+            LogError("%s: Invalid network magic in %s\n",
+                     __func__, fs::PathToString(peers_db_path));
+            return;
+        }
+        verifier >> peers;
+        uint256 hashStored;
+        filein >> hashStored;
+        if (hashStored != verifier.GetHash()) {
+            LogError("%s: Checksum mismatch in %s — file may be corrupt\n",
+                     __func__, fs::PathToString(peers_db_path));
+            return;
+        }
+    } catch (const std::exception& e) {
+        LogError("%s: Failed to read %s: %s\n",
+                 __func__, fs::PathToString(peers_db_path), e.what());
+        return;
+    }
+
+    LogInfo("Loaded %d UDP peer(s) from %s\n",
+            peers.size(), fs::PathToString(peers_db_path.filename()));
+
+    // Restore mapPersistentNodes. Do NOT call OpenUDPConnectionTo here
+    // UDP sockets may not be open yet. The timer_func loop picks up any
+    // mapPersistentNodes entry missing from mapUDPNodes and opens it.
+    std::unique_lock<std::recursive_mutex> lock(cs_mapUDPNodes);
+    for (const UDPPeerEntry& e : peers) {
+        std::optional<CService> service = Lookup(e.addr_str, 0, false);
+        if (!service) {
+            LogError("%s: Failed to parse address \"%s\" from %s, skipping\n",
+                     __func__, e.addr_str, fs::PathToString(peers_db_path));
+            continue;
+        }
+        if (mapPersistentNodes.count(service.value())) continue; // already added from -addudpnode
+        UDPConnectionInfo info;
+        info.local_magic     = htole64_internal(e.local_magic);   // host -> LE
+        info.remote_magic    = htole64_internal(e.remote_magic);  // host -> LE
+        info.group           = static_cast<size_t>(e.group);
+        info.fTrusted        = e.fTrusted;
+        info.connection_type = static_cast<UDPConnectionType>(e.connection_type);
+        mapPersistentNodes[service.value()] = info;
+    }
 }
 
 static void OpenLocalDeviceConnection(bool fWrite) {

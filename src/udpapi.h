@@ -9,6 +9,7 @@
 
 #include <netaddress.h>
 #include <node/context.h>
+#include <util/fs.h>
 
 class CBlock;
 
@@ -38,5 +39,13 @@ struct UDPConnectionStats {
 void GetUDPConnectionList(std::vector<UDPConnectionStats>& connections_list);
 
 void UDPRelayBlock(const CBlock& block);
+
+/** Write all persistent UDP peers to disk (called on shutdown). */
+void DumpUDPPeers(const fs::path& peers_db_path);
+/** Read persistent UDP peers from disk and restore mapPersistentNodes (called on startup). */
+void LoadUDPPeers(const fs::path& peers_db_path);
+
+/** Filename (relative to datadir) for the persistent UDP peers database. */
+extern const char* const UDP_PEERS_FILENAME;
 
 #endif
