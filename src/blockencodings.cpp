@@ -392,9 +392,24 @@ ReadStatus PartiallyDownloadedChunkBlock::InitData(const CBlockHeaderAndLengthSh
 
     *decoded_block = header;
 
+    int32_t prefilled_txn_offset = -1;
+    for (size_t i = 0; i < comprblock.prefilledtxn.size(); i++) {
+        prefilled_txn_offset += comprblock.prefilledtxn[i].index + 1;
+        bool const inserted = txn_prefilled.insert(std::make_pair(prefilled_txn_offset, i + 1)).second;
+        assert(inserted);
+    }
+
     allTxnFromMempool = true;
     for (const std::shared_ptr<const CTransaction>& tx : txn_available)
         allTxnFromMempool &= tx ? true : false;
+    total_tx_count = txn_available.size();
+    missing_tx_count = 0;
+    missing_tx_bytes = 0;
+    for (size_t i = 0; i < txn_available.size(); i++) {
+        if (txn_available[i]) continue;
+        missing_tx_count++;
+        missing_tx_bytes += comprblock.txlens[get_txlens_index(txn_prefilled, i)];
+    }
     if (allTxnFromMempool)
         return READ_STATUS_OK;
 
@@ -406,13 +421,6 @@ ReadStatus PartiallyDownloadedChunkBlock::InitData(const CBlockHeaderAndLengthSh
     std::chrono::steady_clock::time_point index_offset_mapped;
     if (fBench)
         index_offset_mapped = std::chrono::steady_clock::now();
-
-    int32_t prefilled_txn_offset = -1;
-    for (size_t i = 0; i < comprblock.prefilledtxn.size(); i++) {
-        prefilled_txn_offset += comprblock.prefilledtxn[i].index + 1;
-        bool const inserted = txn_prefilled.insert(std::make_pair(prefilled_txn_offset, i + 1)).second;
-        assert(inserted);
-    }
 
     if (index_offsets.size()) {
         size_t max_offset = index_offsets.rbegin()->first;

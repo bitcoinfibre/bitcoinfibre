@@ -236,6 +236,9 @@ private:
     std::map<size_t, size_t>::iterator fill_coding_index_offsets_it;
     std::map<uint16_t, uint16_t> txn_prefilled; // index -> number of prefilled txn at or below index
     bool haveChunk = true;
+    size_t missing_tx_count = 0;
+    uint64_t missing_tx_bytes = 0;
+    size_t total_tx_count = 0;
 
     mutable uint256 block_hash; // Cached because its called in critical-path by udpnet
 
@@ -257,6 +260,10 @@ public:
     uint256& GetBlockHash() const;
 
     size_t GetMempoolCount() const { return mempool_count; }
+    size_t GetMissingTxCount() const { return missing_tx_count; }
+    uint64_t GetMissingTxBytes() const { return missing_tx_bytes; }
+    size_t GetTotalTxCount() const { return total_tx_count; }
+    bool AreAllTxnsFromMempoolOnly() const { return missing_tx_count == 0 && extra_count == 0; }
 
     // Chunk-based methods are only callable if AreChunksAvailable()
     bool AreChunksAvailable() const;
