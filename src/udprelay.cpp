@@ -635,6 +635,17 @@ static void ProcessBlockThread(const node::NodeContext* node_context) {
                                        decoded_block.GetHash().ToString().c_str(),
                                        coinbase_hex.c_str());
                         }
+                        // Extract BIP34 height from coinbase scriptSig
+                        [[maybe_unused]] int32_t cb_height = 0;
+                        if (!decoded_block.vtx.empty() && !decoded_block.vtx[0]->vin.empty()) {
+                            const auto& scriptSig = decoded_block.vtx[0]->vin[0].scriptSig;
+                            CScript::const_iterator pc = scriptSig.begin();
+                            opcodetype opcode;
+                            std::vector<unsigned char> data;
+                            if (scriptSig.GetOp(pc, opcode, data) && !data.empty() && data.size() <= CScriptNum::nDefaultMaxNumSize) {
+                                cb_height = CScriptNum(data, false).getint();
+                            }
+                        }
                         if (trace_active_rc) {
                             TRACEPOINT(udp, block_reconstructed,
                                        decoded_block.GetHash().ToString().c_str(),
@@ -642,7 +653,8 @@ static void ProcessBlockThread(const node::NodeContext* node_context) {
                                        (uint32_t) total_chunks_used,
                                        (uint32_t) total_chunks_recvd,
                                        (uint32_t) chunksProvidedByNode.size(),
-                                       (int64_t) Ticks<std::chrono::microseconds>(SteadyClock::now() - block.timeHeaderRecvd));
+                                       (int64_t) Ticks<std::chrono::microseconds>(SteadyClock::now() - block.timeHeaderRecvd),
+                                       (int32_t) cb_height);
                         }
                     }
 
