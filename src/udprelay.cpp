@@ -720,13 +720,25 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                                        coinbase_hex.c_str());
                         }
                         if (trace_active_rc) {
+                            // Extract BIP34 height from coinbase scriptSig
+                            int32_t cb_height = 0;
+                            if (!decoded_block.vtx.empty() && !decoded_block.vtx[0]->vin.empty()) {
+                                const auto& scriptSig = decoded_block.vtx[0]->vin[0].scriptSig;
+                                CScript::const_iterator pc = scriptSig.begin();
+                                opcodetype opcode;
+                                std::vector<unsigned char> data;
+                                if (scriptSig.GetOp(pc, opcode, data) && !data.empty()) {
+                                    cb_height = CScriptNum(data, false).getint();
+                                }
+                            }
                             TRACEPOINT(udp, block_reconstructed,
                                        decoded_block.GetHash().ToString().c_str(),
                                        src.c_str(),
                                        (uint32_t) total_chunks_used,
                                        (uint32_t) total_chunks_recvd,
                                        (uint32_t) chunksProvidedByNode.size(),
-                                       (int64_t) Ticks<std::chrono::microseconds>(SteadyClock::now() - block.timeHeaderRecvd));
+                                       (int64_t) Ticks<std::chrono::microseconds>(SteadyClock::now() - block.timeHeaderRecvd),
+                                       (int32_t) cb_height);
                         }
                     }
 
