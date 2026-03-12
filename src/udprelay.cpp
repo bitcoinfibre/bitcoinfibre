@@ -22,6 +22,7 @@
 // USDT tracepoint semaphores for UDP metrics
 TRACEPOINT_SEMAPHORE(udp, block_coinbase);
 TRACEPOINT_SEMAPHORE(udp, block_reconstructed);
+TRACEPOINT_SEMAPHORE(udp, block_reconstruction_detail);
 TRACEPOINT_SEMAPHORE(udp, block_send_start);
 TRACEPOINT_SEMAPHORE(udp, block_header_chunk);
 
@@ -678,7 +679,8 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                     const CBlock& decoded_block = *pdecoded_block;
                     bool trace_active_cb = TRACEPOINT_ACTIVE(udp, block_coinbase);
                     bool trace_active_rc = TRACEPOINT_ACTIVE(udp, block_reconstructed);
-                    if (fBench || trace_active_cb || trace_active_rc) {
+                    bool trace_active_rd = TRACEPOINT_ACTIVE(udp, block_reconstruction_detail);
+                    if (fBench || trace_active_cb || trace_active_rc || trace_active_rd) {
                         std::string src  = block.nodeHeaderRecvd.ToStringAddrPort(); // What IP sent us the block?
 
                         uint32_t total_chunks_recvd = 0, total_chunks_used = 0;
@@ -719,18 +721,18 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                                        decoded_block.GetHash().ToString().c_str(),
                                        coinbase_hex.c_str());
                         }
-                        if (trace_active_rc) {
-                            // Extract BIP34 height from coinbase scriptSig
-                            [[maybe_unused]] int32_t cb_height = 0;
-                            if (!decoded_block.vtx.empty() && !decoded_block.vtx[0]->vin.empty()) {
-                                const auto& scriptSig = decoded_block.vtx[0]->vin[0].scriptSig;
-                                CScript::const_iterator pc = scriptSig.begin();
-                                opcodetype opcode;
-                                std::vector<unsigned char> data;
-                                if (scriptSig.GetOp(pc, opcode, data) && !data.empty()) {
-                                    cb_height = CScriptNum(data, false).getint();
-                                }
+                        // Extract BIP34 height from coinbase scriptSig
+                        [[maybe_unused]] int32_t cb_height = 0;
+                        if (!decoded_block.vtx.empty() && !decoded_block.vtx[0]->vin.empty()) {
+                            const auto& scriptSig = decoded_block.vtx[0]->vin[0].scriptSig;
+                            CScript::const_iterator pc = scriptSig.begin();
+                            opcodetype opcode;
+                            std::vector<unsigned char> data;
+                            if (scriptSig.GetOp(pc, opcode, data) && !data.empty()) {
+                                cb_height = CScriptNum(data, false).getint();
                             }
+                        }
+                        if (trace_active_rc) {
                             TRACEPOINT(udp, block_reconstructed,
                                        decoded_block.GetHash().ToString().c_str(),
                                        src.c_str(),
@@ -739,6 +741,16 @@ static void ProcessBlockThread(ChainstateManager* chainman, PeerManager* peer_ma
                                        (uint32_t) chunksProvidedByNode.size(),
                                        (int64_t) Ticks<std::chrono::microseconds>(SteadyClock::now() - block.timeHeaderRecvd),
                                        (int32_t) cb_height);
+                        }
+                        if (trace_active_rd) {
+                            TRACEPOINT(udp, block_reconstruction_detail,
+                                       decoded_block.GetHash().ToString().c_str(),
+                                       (int32_t) cb_height,
+                                       (uint32_t) block.block_data.GetMissingTxCount(),
+                                       (uint64_t) block.block_data.GetMissingTxBytes(),
+                                       (uint32_t) block.block_data.GetMempoolCount(),
+                                       (uint32_t) block.block_data.GetTotalTxCount(),
+                                       (int32_t) block.block_data.AreAllTxnsFromMempoolOnly());
                         }
                     }
 
