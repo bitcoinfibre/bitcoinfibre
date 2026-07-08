@@ -66,6 +66,14 @@ FECDecoder::FECDecoder(size_t data_size) :
 }
 
 FECDecoder& FECDecoder::operator=(FECDecoder&& decoder) {
+    if (this == &decoder)
+        return *this;
+
+    if (state) {
+        return_wirehair_codec(state);
+        state = nullptr;
+    }
+
     chunk_count       = decoder.chunk_count;
     chunks_recvd      = decoder.chunks_recvd;
     decodeComplete    = decoder.decodeComplete;
