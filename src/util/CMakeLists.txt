@@ -30,6 +30,7 @@ add_library(bitcoin_util STATIC EXCLUDE_FROM_ALL
   time.cpp
   tokenpipe.cpp
   ../logging.cpp
+  ../logging/async_file_writer.cpp
   ../random.cpp
   ../randomenv.cpp
   ../streams.cpp
