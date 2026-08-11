@@ -46,9 +46,27 @@ BCLog::Logger& LogInstance()
 
 bool fLogIPs = DEFAULT_LOGIPS;
 
-static int FileWriteStr(std::string_view str, FILE *fp)
+void StopDebugLogFlushThread()
 {
-    return fwrite(str.data(), 1, str.size(), fp);
+    LogInstance().StopFileWriter();
+}
+
+int BCLog::Logger::WriteToFile(std::string_view str)
+{
+    assert(m_fileout != nullptr);
+    if (m_file_writer.Write(std::string{str}) == EnqueueResult::Queued) return str.size();
+    return fwrite(str.data(), 1, str.size(), m_fileout);
+}
+
+void BCLog::Logger::FlushFileWriterForTesting()
+{
+    StdLockGuard scoped_lock(m_cs);
+    m_file_writer.Flush();
+}
+
+void BCLog::Logger::StopFileWriter()
+{
+    m_file_writer.Stop();
 }
 
 bool BCLog::Logger::StartLogging()
@@ -67,9 +85,17 @@ bool BCLog::Logger::StartLogging()
 
         setbuf(m_fileout, nullptr); // unbuffered
 
+        try {
+            m_file_writer.Start(m_fileout);
+        } catch (...) {
+            fclose(m_fileout);
+            m_fileout = nullptr;
+            throw;
+        }
+
         // Add newlines to the logfile to distinguish this execution from the
         // last one.
-        FileWriteStr("\n\n\n\n\n", m_fileout);
+        WriteToFile("\n\n\n\n\n");
     }
 
     // dump buffered messages from before we opened the log
@@ -83,7 +109,7 @@ bool BCLog::Logger::StartLogging()
         FormatLogStrInPlace(s, buflog.category, buflog.level, buflog.source_loc, buflog.threadname, buflog.now, buflog.mocktime);
         m_msgs_before_open.pop_front();
 
-        if (m_print_to_file) FileWriteStr(s, m_fileout);
+        if (m_print_to_file) WriteToFile(s);
         if (m_print_to_console) fwrite(s.data(), 1, s.size(), stdout);
         for (const auto& cb : m_print_callbacks) {
             cb(s);
@@ -99,6 +125,7 @@ void BCLog::Logger::DisconnectTestLogger()
 {
     StdLockGuard scoped_lock(m_cs);
     m_buffering = true;
+    StopFileWriter();
     if (m_fileout != nullptr) fclose(m_fileout);
     m_fileout = nullptr;
     m_print_callbacks.clear();
@@ -498,16 +525,19 @@ void BCLog::Logger::LogPrintStr_(std::string_view str, std::source_location&& so
         assert(m_fileout != nullptr);
 
         // reopen the log file, if requested
-        if (m_reopen_file) {
-            m_reopen_file = false;
-            FILE* new_fileout = fsbridge::fopen(m_file_path, "a");
-            if (new_fileout) {
-                setbuf(new_fileout, nullptr); // unbuffered
-                fclose(m_fileout);
-                m_fileout = new_fileout;
+        if (m_reopen_file.exchange(false)) {
+            FILE* replacement = fsbridge::fopen(m_file_path, "a");
+            if (replacement) {
+                setbuf(replacement, nullptr); // unbuffered
+                if (m_file_writer.Reopen(replacement) == EnqueueResult::Queued) {
+                    m_fileout = replacement;
+                } else {
+                    fclose(m_fileout);
+                    m_fileout = replacement;
+                }
             }
         }
-        FileWriteStr(str_prefixed, m_fileout);
+        WriteToFile(str_prefixed);
     }
 }
 
