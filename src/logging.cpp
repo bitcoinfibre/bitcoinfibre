@@ -17,10 +17,6 @@
 #include <optional>
 #include <utility>
 
-#include <condition_variable>
-#include <mutex>
-#include <thread>
-
 using util::Join;
 using util::RemovePrefixView;
 
@@ -50,94 +46,29 @@ BCLog::Logger& LogInstance()
 
 bool fLogIPs = DEFAULT_LOGIPS;
 
-#define LOG_LINE_BUFFER_SIZE 128
-
-static std::atomic_int g_next_pending_log_line(0);
-static std::atomic_int g_next_undef_log_line(0);
-static std::atomic_bool g_debug_log_flush_thread_exit;
-static std::mutex g_log_buff_mutex;
-static std::condition_variable g_log_buff_cv;
-static std::array<std::string, LOG_LINE_BUFFER_SIZE> g_debug_log_buff;
-static std::unique_ptr<std::thread> g_buff_flush_thread; // non-ptr fails to build in LTO?
-static std::once_flag g_buff_flush_thread_started;
-
-static void DebugLogFlush(FILE *fp)
+void StopDebugLogFlushThread()
 {
-    while (true) {
-        int next_pending_log = g_next_pending_log_line.load(std::memory_order_acquire);
-
-        int next_undef_log = g_next_undef_log_line.load(std::memory_order_acquire);
-
-        if (next_pending_log == next_undef_log) {
-            if (g_debug_log_flush_thread_exit) return;
-
-            std::unique_lock<std::mutex> lock(g_log_buff_mutex);
-
-            while (next_pending_log == next_undef_log && !g_debug_log_flush_thread_exit) {
-                g_log_buff_cv.wait(lock);
-                next_pending_log = g_next_pending_log_line.load(std::memory_order_acquire);
-                next_undef_log = g_next_undef_log_line.load(std::memory_order_acquire);
-            }
-        }
-
-        while (next_pending_log != next_undef_log) {
-            fwrite(g_debug_log_buff[next_pending_log].data(), 1, g_debug_log_buff[next_pending_log].size(), fp);
-            g_debug_log_buff[next_pending_log].clear();
-            g_debug_log_buff[next_pending_log].shrink_to_fit();
-            next_pending_log = (next_pending_log + 1) % LOG_LINE_BUFFER_SIZE;
-            g_next_pending_log_line.store(next_pending_log, std::memory_order_release);
-            g_log_buff_cv.notify_one();
-        }
-    }
+    LogInstance().StopFileWriter();
 }
 
-void StopDebugLogFlushThread() {
-    g_debug_log_flush_thread_exit = true;
-
-    {
-        std::unique_lock<std::mutex> lock(g_log_buff_mutex);
-        g_log_buff_cv.notify_all();
-    }
-
-    if (g_buff_flush_thread) {
-        g_buff_flush_thread->join();
-    }
-}
-
-static int FileWriteStr(std::string_view str, FILE *fp)
+int BCLog::Logger::WriteToFile(std::string_view str)
 {
-    // return fwrite(str.data(), 1, str.size(), fp);
-    std::call_once(g_buff_flush_thread_started, [fp] {
-        g_buff_flush_thread.reset(new std::thread(DebugLogFlush, fp));
-    });
-
-    std::unique_lock<std::mutex> lock(g_log_buff_mutex);
-
-    int next_pending_log = g_next_pending_log_line.load(std::memory_order_acquire);
-
-    int next_undef_log = g_next_undef_log_line.load(std::memory_order_acquire);
-
-    while (next_pending_log == (next_undef_log + 1) % LOG_LINE_BUFFER_SIZE && !g_debug_log_flush_thread_exit) {
-        g_log_buff_cv.wait(lock);
-        next_pending_log = g_next_pending_log_line.load(std::memory_order_acquire);
-        next_undef_log = g_next_undef_log_line.load(std::memory_order_acquire);
-    }
-
-    if (g_debug_log_flush_thread_exit) {
-        return fwrite(str.data(), 1, str.size(), fp);
-    } else {
-        g_debug_log_buff[next_undef_log] = str;
-        g_next_undef_log_line.store((next_undef_log + 1) % LOG_LINE_BUFFER_SIZE, std::memory_order_release);
-        g_log_buff_cv.notify_all();
-        return str.size();
-    }
+    assert(m_fileout != nullptr);
+    if (m_file_writer.Write(std::string{str}) == EnqueueResult::Queued) return str.size();
+    return fwrite(str.data(), 1, str.size(), m_fileout);
 }
 
-/* static int FileWriteStr(std::string_view str, FILE *fp)
+void BCLog::Logger::FlushFileWriterForTesting()
 {
-    return fwrite(str.data(), 1, str.size(), fp);
+    StdLockGuard scoped_lock(m_cs);
+    m_file_writer.Flush();
 }
- */
+
+void BCLog::Logger::StopFileWriter()
+{
+    m_file_writer.Stop();
+}
+
 bool BCLog::Logger::StartLogging()
 {
     StdLockGuard scoped_lock(m_cs);
@@ -154,9 +85,17 @@ bool BCLog::Logger::StartLogging()
 
         setbuf(m_fileout, nullptr); // unbuffered
 
+        try {
+            m_file_writer.Start(m_fileout);
+        } catch (...) {
+            fclose(m_fileout);
+            m_fileout = nullptr;
+            throw;
+        }
+
         // Add newlines to the logfile to distinguish this execution from the
         // last one.
-        FileWriteStr("\n\n\n\n\n", m_fileout);
+        WriteToFile("\n\n\n\n\n");
     }
 
     // dump buffered messages from before we opened the log
@@ -170,7 +109,7 @@ bool BCLog::Logger::StartLogging()
         FormatLogStrInPlace(s, buflog.category, buflog.level, buflog.source_loc, buflog.threadname, buflog.now, buflog.mocktime);
         m_msgs_before_open.pop_front();
 
-        if (m_print_to_file) FileWriteStr(s, m_fileout);
+        if (m_print_to_file) WriteToFile(s);
         if (m_print_to_console) fwrite(s.data(), 1, s.size(), stdout);
         for (const auto& cb : m_print_callbacks) {
             cb(s);
@@ -186,6 +125,7 @@ void BCLog::Logger::DisconnectTestLogger()
 {
     StdLockGuard scoped_lock(m_cs);
     m_buffering = true;
+    StopFileWriter();
     if (m_fileout != nullptr) fclose(m_fileout);
     m_fileout = nullptr;
     m_print_callbacks.clear();
@@ -587,16 +527,19 @@ void BCLog::Logger::LogPrintStr_(std::string_view str, SourceLocation&& source_l
         assert(m_fileout != nullptr);
 
         // reopen the log file, if requested
-        if (m_reopen_file) {
-            m_reopen_file = false;
-            FILE* new_fileout = fsbridge::fopen(m_file_path, "a");
-            if (new_fileout) {
-                setbuf(new_fileout, nullptr); // unbuffered
-                fclose(m_fileout);
-                m_fileout = new_fileout;
+        if (m_reopen_file.exchange(false)) {
+            FILE* replacement = fsbridge::fopen(m_file_path, "a");
+            if (replacement) {
+                setbuf(replacement, nullptr); // unbuffered
+                if (m_file_writer.Reopen(replacement) == EnqueueResult::Queued) {
+                    m_fileout = replacement;
+                } else {
+                    fclose(m_fileout);
+                    m_fileout = replacement;
+                }
             }
         }
-        FileWriteStr(str_prefixed, m_fileout);
+        WriteToFile(str_prefixed);
     }
 }
 

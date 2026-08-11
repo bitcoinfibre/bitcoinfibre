@@ -14,13 +14,23 @@
 #include <util/fs_helpers.h>
 #include <util/string.h>
 
+#include <array>
+#include <cassert>
+#include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <fstream>
 #include <future>
 #include <ios>
 #include <iostream>
+#include <iterator>
+#include <latch>
+#include <optional>
+#include <semaphore>
 #include <source_location>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -41,6 +51,7 @@ static void ResetLogger()
 static std::vector<std::string> ReadDebugLogLines()
 {
     std::vector<std::string> lines;
+    LogInstance().FlushFileWriterForTesting();
     std::ifstream ifs{LogInstance().m_file_path.std_path()};
     for (std::string line; std::getline(ifs, line);) {
         lines.push_back(std::move(line));
@@ -102,6 +113,320 @@ struct LogSetup : public BasicTestingSetup {
         LogInstance().EnableCategory(BCLog::LogFlags{prev_category_mask});
     }
 };
+
+namespace {
+
+constexpr std::string_view STARTUP_SEPARATORS{"\n\n\n\n\n"};
+constexpr std::ptrdiff_t RELEASE_ALL_COUNT{512};
+using Gate = std::counting_semaphore<1024>;
+
+class ReleaseGateOnDestruction
+{
+public:
+    explicit ReleaseGateOnDestruction(Gate& gate) noexcept : m_gate{gate} {}
+
+    ~ReleaseGateOnDestruction() noexcept
+    {
+        m_gate.release(RELEASE_ALL_COUNT);
+    }
+
+    ReleaseGateOnDestruction(const ReleaseGateOnDestruction&) = delete;
+    ReleaseGateOnDestruction& operator=(const ReleaseGateOnDestruction&) = delete;
+
+private:
+    Gate& m_gate;
+};
+
+class LocalLoggerOwner
+{
+public:
+    explicit LocalLoggerOwner(BCLog::Logger& logger) : m_logger{logger} {}
+
+    ~LocalLoggerOwner()
+    {
+        if (m_started) m_logger.DisconnectTestLogger();
+    }
+
+    LocalLoggerOwner(const LocalLoggerOwner&) = delete;
+    LocalLoggerOwner& operator=(const LocalLoggerOwner&) = delete;
+
+    bool Start()
+    {
+        assert(!m_started);
+        m_started = m_logger.StartLogging();
+        return m_started;
+    }
+
+    void Disconnect()
+    {
+        assert(m_started);
+        m_logger.DisconnectTestLogger();
+        m_started = false;
+    }
+
+private:
+    BCLog::Logger& m_logger;
+    bool m_started{false};
+};
+
+void RemoveExactFile(const fs::path& path)
+{
+    std::error_code error;
+    fs::remove(path, error);
+    BOOST_REQUIRE(!error);
+}
+
+void ConfigureLocalFileLogger(BCLog::Logger& logger, const fs::path& path)
+{
+    RemoveExactFile(path);
+    logger.m_print_to_console = false;
+    logger.m_print_to_file = true;
+    logger.m_log_timestamps = false;
+    logger.m_log_time_micros = false;
+    logger.m_log_threadnames = false;
+    logger.m_log_sourcelocations = false;
+    logger.m_always_print_category_level = false;
+    logger.m_file_path = path;
+    logger.m_reopen_file = false;
+    logger.SetRateLimiting(nullptr);
+}
+
+void LogLocal(BCLog::Logger& logger, std::string_view message)
+{
+    logger.LogPrintStr(message, SourceLocation{__func__}, BCLog::ALL, BCLog::Level::Info, /*should_ratelimit=*/false);
+}
+
+std::string ReadLocalFile(const fs::path& path)
+{
+    std::ifstream file{path.std_path(), std::ios::binary};
+    BOOST_REQUIRE(file.is_open());
+    return {std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+}
+
+struct ProducerOrdinal {
+    size_t producer;
+    size_t ordinal;
+};
+
+std::string ProducerLine(size_t producer, size_t ordinal)
+{
+    return "producer=" + std::to_string(producer) + ";ordinal=" + std::to_string(ordinal) + "\n";
+}
+
+std::optional<ProducerOrdinal> ParseProducerLine(std::string_view line)
+{
+    constexpr std::string_view PRODUCER_PREFIX{"producer="};
+    constexpr std::string_view ORDINAL_PREFIX{"ordinal="};
+    if (!line.ends_with('\n')) return std::nullopt;
+    line.remove_suffix(1);
+    if (!line.starts_with(PRODUCER_PREFIX)) return std::nullopt;
+    line.remove_prefix(PRODUCER_PREFIX.size());
+
+    const size_t separator{line.find(';')};
+    if (separator == std::string_view::npos) return std::nullopt;
+    const std::string_view producer_text{line.substr(0, separator)};
+    line.remove_prefix(separator + 1);
+    if (!line.starts_with(ORDINAL_PREFIX)) return std::nullopt;
+    line.remove_prefix(ORDINAL_PREFIX.size());
+    if (producer_text.empty() || line.empty()) return std::nullopt;
+
+    ProducerOrdinal result{};
+    const auto [producer_end, producer_error]{std::from_chars(producer_text.begin(), producer_text.end(), result.producer)};
+    if (producer_error != std::errc{} || producer_end != producer_text.end()) return std::nullopt;
+    const auto [ordinal_end, ordinal_error]{std::from_chars(line.begin(), line.end(), result.ordinal)};
+    if (ordinal_error != std::errc{} || ordinal_end != line.end()) return std::nullopt;
+    return result;
+}
+
+std::vector<std::string> SplitProducerLines(std::string_view output)
+{
+    std::vector<std::string> lines;
+    size_t offset{0};
+    while (offset < output.size()) {
+        const size_t newline{output.find('\n', offset)};
+        BOOST_REQUIRE(newline != std::string_view::npos);
+        lines.emplace_back(output.substr(offset, newline - offset + 1));
+        offset = newline + 1;
+    }
+    return lines;
+}
+
+void CheckProducerLines(const std::vector<std::string>& lines, size_t producer_count, size_t operations_per_producer)
+{
+    BOOST_CHECK_EQUAL(lines.size(), producer_count * operations_per_producer);
+    std::vector<std::vector<unsigned int>> seen(producer_count, std::vector<unsigned int>(operations_per_producer));
+    std::vector<size_t> next_ordinal(producer_count);
+    for (const std::string& line : lines) {
+        const auto parsed{ParseProducerLine(line)};
+        BOOST_REQUIRE(parsed.has_value());
+        BOOST_REQUIRE(parsed->producer < producer_count);
+        BOOST_REQUIRE(parsed->ordinal < operations_per_producer);
+        BOOST_CHECK_EQUAL(parsed->ordinal, next_ordinal[parsed->producer]);
+        ++next_ordinal[parsed->producer];
+        BOOST_CHECK_EQUAL(seen[parsed->producer][parsed->ordinal], 0U);
+        ++seen[parsed->producer][parsed->ordinal];
+    }
+    for (size_t producer{0}; producer < producer_count; ++producer) {
+        BOOST_CHECK_EQUAL(next_ordinal[producer], operations_per_producer);
+        for (size_t ordinal{0}; ordinal < operations_per_producer; ++ordinal) {
+            BOOST_CHECK_EQUAL(seen[producer][ordinal], 1U);
+        }
+    }
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(logger_successful_reopen_is_ordered)
+{
+    const fs::path path_a{m_args.GetDataDirBase() / "logger_ordered_reopen_a.log"};
+    const fs::path path_b{m_args.GetDataDirBase() / "logger_ordered_reopen_b.log"};
+    RemoveExactFile(path_b);
+    BCLog::Logger logger;
+    LocalLoggerOwner owner{logger};
+    ConfigureLocalFileLogger(logger, path_a);
+    BOOST_REQUIRE(owner.Start());
+
+    LogLocal(logger, "ordered-a-1");
+    LogLocal(logger, "ordered-a-2");
+    logger.m_file_path = path_b;
+    logger.m_reopen_file = true;
+    LogLocal(logger, "ordered-b-1");
+    LogLocal(logger, "ordered-b-2");
+    logger.FlushFileWriterForTesting();
+
+    BOOST_CHECK_EQUAL(ReadLocalFile(path_a), std::string{STARTUP_SEPARATORS} + "ordered-a-1\nordered-a-2\n");
+    BOOST_CHECK_EQUAL(ReadLocalFile(path_b), "ordered-b-1\nordered-b-2\n");
+    owner.Disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(failed_reopen_keeps_old_stream_active)
+{
+    const fs::path original_path{m_args.GetDataDirBase() / "logger_failed_reopen.log"};
+    BCLog::Logger logger;
+    LocalLoggerOwner owner{logger};
+    ConfigureLocalFileLogger(logger, original_path);
+    BOOST_REQUIRE(owner.Start());
+    logger.FlushFileWriterForTesting();
+    BOOST_REQUIRE(fs::is_regular_file(original_path));
+
+    const fs::path invalid_path{original_path / "child"};
+    logger.m_file_path = invalid_path;
+    logger.m_reopen_file = true;
+    LogLocal(logger, "failed-reopen-current");
+    LogLocal(logger, "failed-reopen-continuation");
+    logger.FlushFileWriterForTesting();
+
+    BOOST_CHECK_EQUAL(ReadLocalFile(original_path), std::string{STARTUP_SEPARATORS} + "failed-reopen-current\nfailed-reopen-continuation\n");
+    BOOST_CHECK(!fs::exists(invalid_path));
+    owner.Disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(logger_synchronous_fallback_after_stop)
+{
+    const fs::path path{m_args.GetDataDirBase() / "logger_synchronous_fallback.log"};
+    BCLog::Logger logger;
+    LocalLoggerOwner owner{logger};
+    ConfigureLocalFileLogger(logger, path);
+    BOOST_REQUIRE(owner.Start());
+
+    LogLocal(logger, "asynchronous-before-stop");
+    logger.FlushFileWriterForTesting();
+    logger.StopFileWriter();
+    LogLocal(logger, "synchronous-after-stop");
+
+    BOOST_CHECK_EQUAL(ReadLocalFile(path), std::string{STARTUP_SEPARATORS} + "asynchronous-before-stop\nsynchronous-after-stop\n");
+    owner.Disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(logger_repeated_start_disconnect_uses_distinct_paths)
+{
+    const std::array<fs::path, 3> paths{
+        m_args.GetDataDirBase() / "logger_restart_0.log",
+        m_args.GetDataDirBase() / "logger_restart_1.log",
+        m_args.GetDataDirBase() / "logger_restart_2.log",
+    };
+    BCLog::Logger logger;
+    LocalLoggerOwner owner{logger};
+
+    for (size_t run{0}; run < paths.size(); ++run) {
+        ConfigureLocalFileLogger(logger, paths[run]);
+        BOOST_REQUIRE(owner.Start());
+        const std::string marker{"restart-run-" + std::to_string(run)};
+        LogLocal(logger, marker);
+        logger.FlushFileWriterForTesting();
+        owner.Disconnect();
+        BOOST_CHECK_EQUAL(ReadLocalFile(paths[run]), std::string{STARTUP_SEPARATORS} + marker + "\n");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(logger_concurrent_producers_preserve_per_producer_order)
+{
+    constexpr size_t PRODUCER_COUNT{4};
+    constexpr size_t OPERATIONS_PER_PRODUCER{32};
+    const fs::path path{m_args.GetDataDirBase() / "logger_concurrent_producers.log"};
+    std::vector<std::string> callback_lines;
+    BCLog::Logger logger;
+    LocalLoggerOwner owner{logger};
+    ConfigureLocalFileLogger(logger, path);
+    const auto callback{logger.PushBackCallback([&](const std::string& line) { callback_lines.push_back(line); })};
+    BOOST_REQUIRE(owner.Start());
+
+    std::latch producers_ready{PRODUCER_COUNT};
+    Gate producers_release{0};
+    std::vector<std::future<void>> producers;
+    producers.reserve(PRODUCER_COUNT);
+    ReleaseGateOnDestruction release_gate_on_destruction{producers_release};
+    for (size_t producer{0}; producer < PRODUCER_COUNT; ++producer) {
+        producers.emplace_back(std::async(std::launch::async, [&logger, &producers_ready, &producers_release, producer] {
+            producers_ready.count_down();
+            producers_release.acquire();
+            for (size_t ordinal{0}; ordinal < OPERATIONS_PER_PRODUCER; ++ordinal) {
+                LogLocal(logger, ProducerLine(producer, ordinal));
+            }
+        }));
+    }
+    producers_ready.wait();
+    for (auto& producer : producers) {
+        BOOST_REQUIRE(producer.valid());
+        BOOST_CHECK(producer.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+    }
+    producers_release.release(PRODUCER_COUNT);
+    for (auto& producer : producers) {
+        BOOST_REQUIRE(producer.wait_for(std::chrono::seconds{120}) == std::future_status::ready);
+        producer.get();
+    }
+
+    logger.FlushFileWriterForTesting();
+    const std::string file_output{ReadLocalFile(path)};
+    BOOST_REQUIRE(file_output.starts_with(STARTUP_SEPARATORS));
+    const std::vector<std::string> file_lines{SplitProducerLines(std::string_view{file_output}.substr(STARTUP_SEPARATORS.size()))};
+    CheckProducerLines(callback_lines, PRODUCER_COUNT, OPERATIONS_PER_PRODUCER);
+    CheckProducerLines(file_lines, PRODUCER_COUNT, OPERATIONS_PER_PRODUCER);
+
+    logger.DeleteCallback(callback);
+    owner.Disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(logger_callback_and_console_delivery_remains_ordered)
+{
+    const fs::path path{m_args.GetDataDirBase() / "logger_callback_console.log"};
+    std::vector<std::string> callback_lines;
+    BCLog::Logger logger;
+    LocalLoggerOwner owner{logger};
+    ConfigureLocalFileLogger(logger, path);
+    logger.m_print_to_console = true;
+    const auto callback{logger.PushBackCallback([&](const std::string& line) { callback_lines.push_back(line); })};
+    BOOST_REQUIRE(owner.Start());
+
+    LogLocal(logger, "callback-console-marker");
+    BOOST_REQUIRE_EQUAL(callback_lines.size(), 1U);
+    BOOST_CHECK_EQUAL(callback_lines.front(), "callback-console-marker\n");
+    logger.FlushFileWriterForTesting();
+    BOOST_CHECK_EQUAL(ReadLocalFile(path), std::string{STARTUP_SEPARATORS} + "callback-console-marker\n");
+
+    logger.DeleteCallback(callback);
+    owner.Disconnect();
+}
 
 BOOST_AUTO_TEST_CASE(logging_timer)
 {
@@ -401,7 +726,11 @@ void TestLogFromLocation(Location location, const std::string& message,
     using Status = BCLog::LogRateLimiter::Status;
     if (!suppressions_active) assert(status == Status::UNSUPPRESSED); // developer error
 
-    std::ofstream ofs(LogInstance().m_file_path.std_path(), std::ios::out | std::ios::trunc); // clear debug log
+    LogInstance().FlushFileWriterForTesting();
+    {
+        std::ofstream ofs(LogInstance().m_file_path.std_path(), std::ios::out | std::ios::trunc); // clear debug log
+        BOOST_REQUIRE(ofs.is_open());
+    }
     LogFromLocation(location, message);
     auto log_lines{ReadDebugLogLines()};
     BOOST_TEST_INFO_SCOPE(log_lines.size() << " log_lines read: \n" << util::Join(log_lines, "\n"));
