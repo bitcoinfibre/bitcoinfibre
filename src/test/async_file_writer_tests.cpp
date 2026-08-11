@@ -30,6 +30,7 @@ namespace {
 
 using BCLog::AsyncFileWriterEvent;
 using BCLog::AsyncFileWriterEventKind;
+using BCLog::AsyncFileWriterOperationKind;
 using BCLog::EnqueueResult;
 
 constexpr size_t MAX_PENDING_OPERATIONS{127};
@@ -40,6 +41,14 @@ using Gate = std::counting_semaphore<1024>;
 struct EventObservation {
     uint64_t sequence;
     FILE* file;
+};
+
+struct OperationObservation {
+    AsyncFileWriterEventKind event_kind;
+    uint64_t sequence;
+    AsyncFileWriterOperationKind operation_kind;
+    FILE* file;
+    FILE* replacement_file;
 };
 
 template <typename T>
@@ -68,7 +77,7 @@ public:
 
     ~TempFile()
     {
-        if (m_file != nullptr) fclose(m_file);
+        if (m_file != nullptr && !m_worker_closed.load(std::memory_order_acquire)) fclose(m_file);
         std::error_code error;
         fs::remove(m_path, error);
     }
@@ -78,8 +87,19 @@ public:
 
     FILE* Get() const { return m_file; }
 
+    void MarkWorkerClosed() noexcept
+    {
+        m_worker_closed.store(true, std::memory_order_release);
+    }
+
+    bool WasClosedByWorker() const noexcept
+    {
+        return m_worker_closed.load(std::memory_order_acquire);
+    }
+
     std::string Read()
     {
+        BOOST_REQUIRE(!WasClosedByWorker());
         BOOST_REQUIRE_EQUAL(fseek(m_file, 0, SEEK_SET), 0);
         std::string contents;
         std::array<char, 4096> buffer;
@@ -100,6 +120,7 @@ private:
 
     const fs::path m_path;
     FILE* const m_file;
+    std::atomic<bool> m_worker_closed{false};
 };
 
 class TestHooks final : public BCLog::AsyncFileWriterTestHooks
@@ -134,6 +155,7 @@ public:
     }
 
     void Start() { writer.Start(file.Get()); }
+    void Start(FILE* start_file) { writer.Start(start_file); }
 
     TempFile file;
     TestHooks hooks;
@@ -1207,6 +1229,559 @@ BOOST_AUTO_TEST_CASE(restart_generation_isolates_prior_run_waiters)
         context.writer.Stop();
         BOOST_CHECK_EQUAL(context.file.Read(), expected);
         BOOST_CHECK_EQUAL(run_b_file.Read(), "");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(stop_drains_accepted_writes)
+{
+    constexpr size_t LINE_COUNT{16};
+    std::future<void> stop;
+    std::promise<void> operation_one_promise;
+    auto operation_one_future{operation_one_promise.get_future()};
+    std::promise<void> stop_prejoin_promise;
+    auto stop_prejoin_future{stop_prejoin_promise.get_future()};
+    Gate operation_one_release{0};
+    std::atomic<bool> operation_one_recorded{false};
+    std::atomic<bool> stop_prejoin_recorded{false};
+
+    WriterTestContext context{
+        m_path_root,
+        [&](const AsyncFileWriterEvent& event) noexcept {
+            if (event.kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld &&
+                event.sequence == 1 && !operation_one_recorded.exchange(true)) {
+                operation_one_promise.set_value();
+                operation_one_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::StopAfterDrainingNotificationsBeforeJoinLockNotHeld &&
+                       !stop_prejoin_recorded.exchange(true)) {
+                stop_prejoin_promise.set_value();
+            }
+        },
+        [&] { operation_one_release.release(RELEASE_ALL_COUNT); },
+        [&] {
+            if (stop.valid()) stop.wait();
+        }};
+
+    context.Start();
+    std::string expected;
+    for (size_t i{0}; i < LINE_COUNT; ++i) {
+        const std::string line{NumberedLine("stop-drain-", i)};
+        expected += line;
+        RequireQueued(context.writer, line);
+        if (i == 0) {
+            RequireReady(operation_one_future);
+            operation_one_future.get();
+        }
+    }
+
+    stop = std::async(std::launch::async, [&] { context.writer.Stop(); });
+    RequireReady(stop_prejoin_future);
+    stop_prejoin_future.get();
+    CheckNotReady(stop);
+
+    operation_one_release.release();
+    RequireReady(stop);
+    stop.get();
+    BOOST_CHECK_EQUAL(context.file.Read(), expected);
+}
+
+BOOST_AUTO_TEST_CASE(blocked_producer_returns_stopped_during_stop)
+{
+    TempFile run_b_file{m_path_root};
+    std::future<EnqueueResult> overflow_producer;
+    std::future<void> boundary_probe;
+    std::future<void> stop;
+    std::promise<void> operation_one_promise;
+    auto operation_one_future{operation_one_promise.get_future()};
+    std::promise<void> full_wait_promise;
+    auto full_wait_future{full_wait_promise.get_future()};
+    std::promise<void> false_predicate_promise;
+    auto false_predicate_future{false_predicate_promise.get_future()};
+    std::promise<uint64_t> boundary_promise;
+    auto boundary_future{boundary_promise.get_future()};
+    std::promise<void> draining_wait_promise;
+    auto draining_wait_future{draining_wait_promise.get_future()};
+    std::promise<void> stop_prejoin_promise;
+    auto stop_prejoin_future{stop_prejoin_promise.get_future()};
+    Gate operation_one_release{0};
+    Gate full_wait_release{0};
+    Gate boundary_release{0};
+    Gate draining_wait_release{0};
+    std::atomic<bool> operation_one_recorded{false};
+    std::atomic<bool> full_wait_recorded{false};
+    std::atomic<bool> false_predicate_recorded{false};
+    std::atomic<bool> boundary_recorded{false};
+    std::atomic<bool> draining_wait_recorded{false};
+    std::atomic<bool> stop_prejoin_recorded{false};
+
+    WriterTestContext context{
+        m_path_root,
+        [&](const AsyncFileWriterEvent& event) noexcept {
+            if (event.kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld &&
+                event.sequence == 1 && !operation_one_recorded.exchange(true)) {
+                operation_one_promise.set_value();
+                operation_one_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::ProducerBeforeFullWaitLockHeld &&
+                       !full_wait_recorded.exchange(true)) {
+                full_wait_promise.set_value();
+                full_wait_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::ProducerFullPredicateFalseLockHeld &&
+                       !false_predicate_recorded.exchange(true)) {
+                false_predicate_promise.set_value();
+            } else if (event.kind == AsyncFileWriterEventKind::FlushAfterBoundaryCapturedLockHeld &&
+                       !boundary_recorded.exchange(true)) {
+                boundary_promise.set_value(event.sequence);
+                boundary_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::WriteBeforeDrainingWaitLockHeld &&
+                       !draining_wait_recorded.exchange(true)) {
+                draining_wait_promise.set_value();
+                draining_wait_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::StopAfterDrainingNotificationsBeforeJoinLockNotHeld &&
+                       !stop_prejoin_recorded.exchange(true)) {
+                stop_prejoin_promise.set_value();
+            }
+        },
+        [&] {
+            operation_one_release.release(RELEASE_ALL_COUNT);
+            full_wait_release.release(RELEASE_ALL_COUNT);
+            boundary_release.release(RELEASE_ALL_COUNT);
+            draining_wait_release.release(RELEASE_ALL_COUNT);
+        },
+        [&] {
+            if (overflow_producer.valid()) overflow_producer.wait();
+            if (boundary_probe.valid()) boundary_probe.wait();
+            if (stop.valid()) stop.wait();
+        }};
+
+    context.Start();
+    std::string expected;
+    for (size_t i{0}; i < MAX_PENDING_OPERATIONS; ++i) {
+        const std::string line{NumberedLine("stop-full-", i)};
+        expected += line;
+        RequireQueued(context.writer, line);
+        if (i == 0) {
+            RequireReady(operation_one_future);
+            operation_one_future.get();
+        }
+    }
+
+    const std::string overflow_line{"stop-full-overflow\n"};
+    overflow_producer = std::async(std::launch::async, [&context, overflow_line] {
+        return context.writer.Write(overflow_line);
+    });
+    RequireReady(full_wait_future);
+    full_wait_future.get();
+    full_wait_release.release();
+    RequireReady(false_predicate_future);
+    false_predicate_future.get();
+
+    boundary_probe = std::async(std::launch::async, [&] { context.writer.Flush(); });
+    RequireReady(boundary_future);
+    BOOST_CHECK_EQUAL(boundary_future.get(), MAX_PENDING_OPERATIONS);
+    boundary_release.release();
+
+    stop = std::async(std::launch::async, [&] { context.writer.Stop(); });
+    RequireReady(stop_prejoin_future);
+    stop_prejoin_future.get();
+    RequireReady(draining_wait_future);
+    draining_wait_future.get();
+    CheckNotReady(overflow_producer);
+    CheckNotReady(stop);
+    draining_wait_release.release();
+
+    operation_one_release.release();
+    RequireReady(stop);
+    stop.get();
+    RequireReady(overflow_producer);
+    BOOST_CHECK(overflow_producer.get() == EnqueueResult::Stopped);
+    RequireReady(boundary_probe);
+    boundary_probe.get();
+    BOOST_CHECK_EQUAL(context.file.Read(), expected);
+
+    context.writer.Start(run_b_file.Get());
+    RequireQueued(context.writer, "new-run-marker\n");
+    context.writer.Flush();
+    context.writer.Stop();
+    BOOST_CHECK_EQUAL(run_b_file.Read(), "new-run-marker\n");
+}
+
+BOOST_AUTO_TEST_CASE(stop_is_idempotent_and_single_join_owner)
+{
+    {
+        TempFile file{m_path_root};
+        BCLog::AsyncFileWriter writer;
+        writer.Stop();
+        writer.Start(file.Get());
+        writer.Stop();
+    }
+
+    {
+        TempFile file{m_path_root};
+        BCLog::AsyncFileWriter writer;
+        writer.Start(file.Get());
+        writer.Stop();
+        writer.Stop();
+        writer.Start(file.Get());
+        writer.Stop();
+        BOOST_CHECK_EQUAL(file.Read(), "");
+    }
+
+    {
+        std::future<void> stop_s1;
+        std::future<void> stop_s2;
+        std::promise<void> worker_prelock_promise;
+        auto worker_prelock_future{worker_prelock_promise.get_future()};
+        std::promise<void> join_owner_promise;
+        auto join_owner_future{join_owner_promise.get_future()};
+        std::promise<void> draining_wait_promise;
+        auto draining_wait_future{draining_wait_promise.get_future()};
+        Gate worker_prelock_release{0};
+        Gate join_owner_release{0};
+        Gate draining_wait_release{0};
+        std::atomic<bool> worker_prelock_recorded{false};
+        std::atomic<unsigned int> join_owner_events{0};
+        std::atomic<unsigned int> draining_wait_events{0};
+
+        WriterTestContext context{
+            m_path_root,
+            [&](const AsyncFileWriterEvent& event) noexcept {
+                if (event.kind == AsyncFileWriterEventKind::WorkerBeforeQueueLockLockNotHeld &&
+                    !worker_prelock_recorded.exchange(true)) {
+                    worker_prelock_promise.set_value();
+                    worker_prelock_release.acquire();
+                } else if (event.kind == AsyncFileWriterEventKind::StopAfterDrainingNotificationsBeforeJoinLockNotHeld) {
+                    const unsigned int ordinal{join_owner_events.fetch_add(1) + 1};
+                    if (ordinal == 1) {
+                        join_owner_promise.set_value();
+                        join_owner_release.acquire();
+                    }
+                } else if (event.kind == AsyncFileWriterEventKind::StopBeforeDrainingWaitLockHeld) {
+                    const unsigned int ordinal{draining_wait_events.fetch_add(1) + 1};
+                    if (ordinal == 1) {
+                        draining_wait_promise.set_value();
+                        draining_wait_release.acquire();
+                    }
+                }
+            },
+            [&] {
+                worker_prelock_release.release(RELEASE_ALL_COUNT);
+                join_owner_release.release(RELEASE_ALL_COUNT);
+                draining_wait_release.release(RELEASE_ALL_COUNT);
+            },
+            [&] {
+                if (stop_s1.valid()) stop_s1.wait();
+                if (stop_s2.valid()) stop_s2.wait();
+            }};
+
+        context.Start();
+        RequireReady(worker_prelock_future);
+        worker_prelock_future.get();
+
+        stop_s1 = std::async(std::launch::async, [&] { context.writer.Stop(); });
+        RequireReady(join_owner_future);
+        join_owner_future.get();
+        stop_s2 = std::async(std::launch::async, [&] { context.writer.Stop(); });
+        RequireReady(draining_wait_future);
+        draining_wait_future.get();
+        BOOST_CHECK_EQUAL(join_owner_events.load(), 1U);
+        BOOST_CHECK_EQUAL(draining_wait_events.load(), 1U);
+        CheckNotReady(stop_s1);
+        CheckNotReady(stop_s2);
+
+        draining_wait_release.release();
+        join_owner_release.release();
+        CheckNotReady(stop_s1);
+        CheckNotReady(stop_s2);
+        worker_prelock_release.release();
+
+        RequireReady(stop_s1);
+        stop_s1.get();
+        RequireReady(stop_s2);
+        stop_s2.get();
+        BOOST_CHECK_EQUAL(join_owner_events.load(), 1U);
+        BOOST_CHECK_EQUAL(draining_wait_events.load(), 1U);
+    }
+
+    {
+        TempFile file{m_path_root};
+        {
+            BCLog::AsyncFileWriter writer;
+            writer.Start(file.Get());
+            writer.Stop();
+        }
+        BOOST_CHECK_EQUAL(file.Read(), "");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(sequential_restart_uses_distinct_streams)
+{
+    TempFile file_a{m_path_root};
+    TempFile file_b{m_path_root};
+    BOOST_REQUIRE(file_a.Get() != file_b.Get());
+    BCLog::AsyncFileWriter writer;
+
+    writer.Start(file_a.Get());
+    RequireQueued(writer, "run-a\n");
+    writer.Flush();
+    writer.Stop();
+    BOOST_CHECK_EQUAL(file_a.Read(), "run-a\n");
+
+    writer.Start(file_b.Get());
+    RequireQueued(writer, "run-b\n");
+    writer.Flush();
+    writer.Stop();
+    BOOST_CHECK_EQUAL(file_a.Read(), "run-a\n");
+    BOOST_CHECK_EQUAL(file_b.Read(), "run-b\n");
+}
+
+BOOST_AUTO_TEST_CASE(single_reopen_is_ordered_and_closes_old_stream)
+{
+    TempFile file_a{m_path_root};
+    TempFile file_b{m_path_root};
+    BOOST_REQUIRE(file_a.Get() != file_b.Get());
+    std::promise<void> before_reopen_promise;
+    auto before_reopen_future{before_reopen_promise.get_future()};
+    std::promise<void> after_reopen_promise;
+    auto after_reopen_future{after_reopen_promise.get_future()};
+    Gate before_reopen_release{0};
+    std::atomic<bool> before_reopen_recorded{false};
+    std::atomic<bool> after_reopen_recorded{false};
+    std::array<OperationObservation, 10> operation_events{};
+    std::atomic<size_t> operation_event_count{0};
+
+    WriterTestContext context{
+        m_path_root,
+        [&](const AsyncFileWriterEvent& event) noexcept {
+            if (event.kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld ||
+                event.kind == AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock) {
+                const size_t index{operation_event_count.fetch_add(1)};
+                if (index < operation_events.size()) {
+                    operation_events[index] = {
+                        event.kind,
+                        event.sequence,
+                        event.operation_kind,
+                        event.file,
+                        event.replacement_file,
+                    };
+                }
+            }
+            if (event.kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld &&
+                event.sequence == 3 &&
+                event.operation_kind == AsyncFileWriterOperationKind::ReopenFile &&
+                !before_reopen_recorded.exchange(true)) {
+                before_reopen_promise.set_value();
+                before_reopen_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock &&
+                       event.sequence == 3 &&
+                       event.operation_kind == AsyncFileWriterOperationKind::ReopenFile &&
+                       !after_reopen_recorded.exchange(true)) {
+                file_a.MarkWorkerClosed();
+                after_reopen_promise.set_value();
+            }
+        },
+        [&] { before_reopen_release.release(RELEASE_ALL_COUNT); }};
+
+    context.Start(file_a.Get());
+    RequireQueued(context.writer, "A1\n");
+    RequireQueued(context.writer, "A2\n");
+    BOOST_REQUIRE(context.writer.Reopen(file_b.Get()) == EnqueueResult::Queued);
+    RequireQueued(context.writer, "B1\n");
+    RequireQueued(context.writer, "B2\n");
+
+    RequireReady(before_reopen_future);
+    before_reopen_future.get();
+    BOOST_CHECK_EQUAL(file_a.Read(), "A1\nA2\n");
+    before_reopen_release.release();
+    RequireReady(after_reopen_future);
+    after_reopen_future.get();
+
+    context.writer.Flush();
+    context.writer.Stop();
+    BOOST_CHECK(file_a.WasClosedByWorker());
+    BOOST_CHECK_EQUAL(file_b.Read(), "B1\nB2\n");
+    BOOST_CHECK(!file_b.WasClosedByWorker());
+    BOOST_REQUIRE_EQUAL(operation_event_count.load(), operation_events.size());
+
+    const auto check_event = [&](size_t index,
+                                 AsyncFileWriterEventKind event_kind,
+                                 uint64_t sequence,
+                                 AsyncFileWriterOperationKind operation_kind,
+                                 FILE* file,
+                                 FILE* replacement_file) {
+        const OperationObservation& event{operation_events[index]};
+        BOOST_CHECK(event.event_kind == event_kind);
+        BOOST_CHECK_EQUAL(event.sequence, sequence);
+        BOOST_CHECK(event.operation_kind == operation_kind);
+        BOOST_CHECK(event.file == file);
+        BOOST_CHECK(event.replacement_file == replacement_file);
+    };
+    check_event(0, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 1, AsyncFileWriterOperationKind::WriteLine, file_a.Get(), nullptr);
+    check_event(1, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 1, AsyncFileWriterOperationKind::WriteLine, file_a.Get(), nullptr);
+    check_event(2, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 2, AsyncFileWriterOperationKind::WriteLine, file_a.Get(), nullptr);
+    check_event(3, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 2, AsyncFileWriterOperationKind::WriteLine, file_a.Get(), nullptr);
+    check_event(4, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 3, AsyncFileWriterOperationKind::ReopenFile, file_a.Get(), file_b.Get());
+    check_event(5, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 3, AsyncFileWriterOperationKind::ReopenFile, file_a.Get(), file_b.Get());
+    check_event(6, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 4, AsyncFileWriterOperationKind::WriteLine, file_b.Get(), nullptr);
+    check_event(7, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 4, AsyncFileWriterOperationKind::WriteLine, file_b.Get(), nullptr);
+    check_event(8, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 5, AsyncFileWriterOperationKind::WriteLine, file_b.Get(), nullptr);
+    check_event(9, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 5, AsyncFileWriterOperationKind::WriteLine, file_b.Get(), nullptr);
+    for (size_t index{6}; index < operation_events.size(); ++index) {
+        BOOST_CHECK(operation_events[index].file != file_a.Get());
+    }
+    BOOST_CHECK(operation_events[5].event_kind == AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock);
+    BOOST_CHECK(operation_events[6].event_kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld);
+}
+
+BOOST_AUTO_TEST_CASE(multiple_reopens_preserve_fifo_and_close_order)
+{
+    TempFile file_a{m_path_root};
+    TempFile file_b{m_path_root};
+    TempFile file_c{m_path_root};
+    BOOST_REQUIRE(file_a.Get() != file_b.Get());
+    BOOST_REQUIRE(file_a.Get() != file_c.Get());
+    BOOST_REQUIRE(file_b.Get() != file_c.Get());
+    std::promise<void> worker_prelock_promise;
+    auto worker_prelock_future{worker_prelock_promise.get_future()};
+    std::promise<void> before_first_reopen_promise;
+    auto before_first_reopen_future{before_first_reopen_promise.get_future()};
+    std::promise<void> after_first_reopen_promise;
+    auto after_first_reopen_future{after_first_reopen_promise.get_future()};
+    std::promise<void> before_second_reopen_promise;
+    auto before_second_reopen_future{before_second_reopen_promise.get_future()};
+    std::promise<void> after_second_reopen_promise;
+    auto after_second_reopen_future{after_second_reopen_promise.get_future()};
+    Gate worker_prelock_release{0};
+    Gate before_first_reopen_release{0};
+    Gate before_second_reopen_release{0};
+    std::atomic<bool> worker_prelock_recorded{false};
+    std::atomic<bool> before_first_reopen_recorded{false};
+    std::atomic<bool> after_first_reopen_recorded{false};
+    std::atomic<bool> before_second_reopen_recorded{false};
+    std::atomic<bool> after_second_reopen_recorded{false};
+    std::array<OperationObservation, 10> operation_events{};
+    std::atomic<size_t> operation_event_count{0};
+    std::array<FILE*, 2> close_order{};
+    std::atomic<size_t> close_count{0};
+
+    WriterTestContext context{
+        m_path_root,
+        [&](const AsyncFileWriterEvent& event) noexcept {
+            if (event.kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld ||
+                event.kind == AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock) {
+                const size_t index{operation_event_count.fetch_add(1)};
+                if (index < operation_events.size()) {
+                    operation_events[index] = {
+                        event.kind,
+                        event.sequence,
+                        event.operation_kind,
+                        event.file,
+                        event.replacement_file,
+                    };
+                }
+            }
+            if (event.kind == AsyncFileWriterEventKind::WorkerBeforeQueueLockLockNotHeld &&
+                !worker_prelock_recorded.exchange(true)) {
+                worker_prelock_promise.set_value();
+                worker_prelock_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld &&
+                       event.sequence == 2 &&
+                       event.operation_kind == AsyncFileWriterOperationKind::ReopenFile &&
+                       !before_first_reopen_recorded.exchange(true)) {
+                before_first_reopen_promise.set_value();
+                before_first_reopen_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock &&
+                       event.sequence == 2 &&
+                       event.operation_kind == AsyncFileWriterOperationKind::ReopenFile &&
+                       !after_first_reopen_recorded.exchange(true)) {
+                file_a.MarkWorkerClosed();
+                const size_t index{close_count.fetch_add(1)};
+                if (index < close_order.size()) close_order[index] = file_a.Get();
+                after_first_reopen_promise.set_value();
+            } else if (event.kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld &&
+                       event.sequence == 4 &&
+                       event.operation_kind == AsyncFileWriterOperationKind::ReopenFile &&
+                       !before_second_reopen_recorded.exchange(true)) {
+                before_second_reopen_promise.set_value();
+                before_second_reopen_release.acquire();
+            } else if (event.kind == AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock &&
+                       event.sequence == 4 &&
+                       event.operation_kind == AsyncFileWriterOperationKind::ReopenFile &&
+                       !after_second_reopen_recorded.exchange(true)) {
+                file_b.MarkWorkerClosed();
+                const size_t index{close_count.fetch_add(1)};
+                if (index < close_order.size()) close_order[index] = file_b.Get();
+                after_second_reopen_promise.set_value();
+            }
+        },
+        [&] {
+            worker_prelock_release.release(RELEASE_ALL_COUNT);
+            before_first_reopen_release.release(RELEASE_ALL_COUNT);
+            before_second_reopen_release.release(RELEASE_ALL_COUNT);
+        }};
+
+    context.Start(file_a.Get());
+    RequireReady(worker_prelock_future);
+    worker_prelock_future.get();
+    RequireQueued(context.writer, "A1\n");
+    BOOST_REQUIRE(context.writer.Reopen(file_b.Get()) == EnqueueResult::Queued);
+    RequireQueued(context.writer, "B1\n");
+    BOOST_REQUIRE(context.writer.Reopen(file_c.Get()) == EnqueueResult::Queued);
+    RequireQueued(context.writer, "C1\n");
+    BOOST_CHECK_EQUAL(operation_event_count.load(), 0U);
+
+    worker_prelock_release.release();
+    RequireReady(before_first_reopen_future);
+    before_first_reopen_future.get();
+    BOOST_CHECK_EQUAL(file_a.Read(), "A1\n");
+    before_first_reopen_release.release();
+    RequireReady(after_first_reopen_future);
+    after_first_reopen_future.get();
+
+    RequireReady(before_second_reopen_future);
+    before_second_reopen_future.get();
+    BOOST_CHECK_EQUAL(file_b.Read(), "B1\n");
+    before_second_reopen_release.release();
+    RequireReady(after_second_reopen_future);
+    after_second_reopen_future.get();
+
+    context.writer.Flush();
+    context.writer.Stop();
+    BOOST_CHECK(file_a.WasClosedByWorker());
+    BOOST_CHECK(file_b.WasClosedByWorker());
+    BOOST_CHECK_EQUAL(file_c.Read(), "C1\n");
+    BOOST_CHECK(!file_c.WasClosedByWorker());
+    BOOST_REQUIRE_EQUAL(close_count.load(), close_order.size());
+    BOOST_CHECK(close_order[0] == file_a.Get());
+    BOOST_CHECK(close_order[1] == file_b.Get());
+    BOOST_REQUIRE_EQUAL(operation_event_count.load(), operation_events.size());
+
+    const auto check_event = [&](size_t index,
+                                 AsyncFileWriterEventKind event_kind,
+                                 uint64_t sequence,
+                                 AsyncFileWriterOperationKind operation_kind,
+                                 FILE* file,
+                                 FILE* replacement_file) {
+        const OperationObservation& event{operation_events[index]};
+        BOOST_CHECK(event.event_kind == event_kind);
+        BOOST_CHECK_EQUAL(event.sequence, sequence);
+        BOOST_CHECK(event.operation_kind == operation_kind);
+        BOOST_CHECK(event.file == file);
+        BOOST_CHECK(event.replacement_file == replacement_file);
+    };
+    check_event(0, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 1, AsyncFileWriterOperationKind::WriteLine, file_a.Get(), nullptr);
+    check_event(1, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 1, AsyncFileWriterOperationKind::WriteLine, file_a.Get(), nullptr);
+    check_event(2, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 2, AsyncFileWriterOperationKind::ReopenFile, file_a.Get(), file_b.Get());
+    check_event(3, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 2, AsyncFileWriterOperationKind::ReopenFile, file_a.Get(), file_b.Get());
+    check_event(4, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 3, AsyncFileWriterOperationKind::WriteLine, file_b.Get(), nullptr);
+    check_event(5, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 3, AsyncFileWriterOperationKind::WriteLine, file_b.Get(), nullptr);
+    check_event(6, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 4, AsyncFileWriterOperationKind::ReopenFile, file_b.Get(), file_c.Get());
+    check_event(7, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 4, AsyncFileWriterOperationKind::ReopenFile, file_b.Get(), file_c.Get());
+    check_event(8, AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, 5, AsyncFileWriterOperationKind::WriteLine, file_c.Get(), nullptr);
+    check_event(9, AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, 5, AsyncFileWriterOperationKind::WriteLine, file_c.Get(), nullptr);
+    for (size_t index{4}; index < operation_events.size(); ++index) {
+        BOOST_CHECK(operation_events[index].file != file_a.Get());
+    }
+    for (size_t index{8}; index < operation_events.size(); ++index) {
+        BOOST_CHECK(operation_events[index].file != file_b.Get());
     }
 }
 
