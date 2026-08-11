@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 
 namespace BCLog {
 
@@ -53,60 +54,13 @@ public:
 
     EnqueueResult Write(std::string line)
     {
-        std::unique_lock<std::mutex> lock{m_mutex};
-        const uint64_t generation{m_run_generation};
+        return Enqueue(WriteLine{std::move(line)});
+    }
 
-        if (m_state == State::Draining) {
-            InvokeHook({AsyncFileWriterEventKind::WriteBeforeDrainingWaitLockHeld});
-            m_progress.wait(lock, [this, generation] {
-                return detail::AsyncFileWriterLifecycleWaitReady(
-                    m_state == State::Stopped, generation, m_run_generation);
-            });
-            return EnqueueResult::Stopped;
-        }
-        if (m_state == State::Stopped) return EnqueueResult::Stopped;
-
-        if (m_count == MAX_PENDING_OPERATIONS) {
-            InvokeHook({AsyncFileWriterEventKind::ProducerBeforeFullWaitLockHeld});
-        }
-        m_not_full.wait(lock, [this, generation] {
-            const bool ready{detail::AsyncFileWriterNotFullWaitReady(
-                m_state == State::Running,
-                m_count,
-                MAX_PENDING_OPERATIONS,
-                generation,
-                m_run_generation)};
-            if (!ready) {
-                InvokeHook({AsyncFileWriterEventKind::ProducerFullPredicateFalseLockHeld});
-            }
-            return ready;
-        });
-
-        if (m_run_generation != generation) return EnqueueResult::Stopped;
-        if (m_state == State::Draining) {
-            InvokeHook({AsyncFileWriterEventKind::WriteBeforeDrainingWaitLockHeld});
-            m_progress.wait(lock, [this, generation] {
-                return detail::AsyncFileWriterLifecycleWaitReady(
-                    m_state == State::Stopped, generation, m_run_generation);
-            });
-            return EnqueueResult::Stopped;
-        }
-        if (m_state == State::Stopped) return EnqueueResult::Stopped;
-
-        assert(m_run_generation == generation);
-        assert(m_state == State::Running);
-        assert(m_count < MAX_PENDING_OPERATIONS);
-        assert(!m_queue[m_tail].has_value());
-
-        const uint64_t sequence{m_next_sequence++};
-        m_queue[m_tail].emplace(Entry{sequence, std::move(line)});
-        m_tail = (m_tail + 1) % MAX_PENDING_OPERATIONS;
-        ++m_count;
-        m_highest_accepted_sequence = sequence;
-
-        lock.unlock();
-        m_not_empty.notify_one();
-        return EnqueueResult::Queued;
+    EnqueueResult Reopen(FILE* replacement)
+    {
+        assert(replacement != nullptr);
+        return Enqueue(ReopenFile{replacement});
     }
 
     void Flush()
@@ -177,10 +131,78 @@ private:
         Draining,
     };
 
-    struct Entry {
-        uint64_t sequence;
+    struct WriteLine {
         std::string line;
     };
+
+    struct ReopenFile {
+        FILE* replacement;
+    };
+
+    using Operation = std::variant<WriteLine, ReopenFile>;
+
+    struct Entry {
+        uint64_t sequence;
+        Operation operation;
+    };
+
+    EnqueueResult Enqueue(Operation operation)
+    {
+        std::unique_lock<std::mutex> lock{m_mutex};
+        const uint64_t generation{m_run_generation};
+
+        if (m_state == State::Draining) {
+            InvokeHook({AsyncFileWriterEventKind::WriteBeforeDrainingWaitLockHeld});
+            m_progress.wait(lock, [this, generation] {
+                return detail::AsyncFileWriterLifecycleWaitReady(
+                    m_state == State::Stopped, generation, m_run_generation);
+            });
+            return EnqueueResult::Stopped;
+        }
+        if (m_state == State::Stopped) return EnqueueResult::Stopped;
+
+        if (m_count == MAX_PENDING_OPERATIONS) {
+            InvokeHook({AsyncFileWriterEventKind::ProducerBeforeFullWaitLockHeld});
+        }
+        m_not_full.wait(lock, [this, generation] {
+            const bool ready{detail::AsyncFileWriterNotFullWaitReady(
+                m_state == State::Running,
+                m_count,
+                MAX_PENDING_OPERATIONS,
+                generation,
+                m_run_generation)};
+            if (!ready) {
+                InvokeHook({AsyncFileWriterEventKind::ProducerFullPredicateFalseLockHeld});
+            }
+            return ready;
+        });
+
+        if (m_run_generation != generation) return EnqueueResult::Stopped;
+        if (m_state == State::Draining) {
+            InvokeHook({AsyncFileWriterEventKind::WriteBeforeDrainingWaitLockHeld});
+            m_progress.wait(lock, [this, generation] {
+                return detail::AsyncFileWriterLifecycleWaitReady(
+                    m_state == State::Stopped, generation, m_run_generation);
+            });
+            return EnqueueResult::Stopped;
+        }
+        if (m_state == State::Stopped) return EnqueueResult::Stopped;
+
+        assert(m_run_generation == generation);
+        assert(m_state == State::Running);
+        assert(m_count < MAX_PENDING_OPERATIONS);
+        assert(!m_queue[m_tail].has_value());
+
+        const uint64_t sequence{m_next_sequence++};
+        m_queue[m_tail].emplace(Entry{sequence, std::move(operation)});
+        m_tail = (m_tail + 1) % MAX_PENDING_OPERATIONS;
+        ++m_count;
+        m_highest_accepted_sequence = sequence;
+
+        lock.unlock();
+        m_not_empty.notify_one();
+        return EnqueueResult::Queued;
+    }
 
     void InvokeHook(const AsyncFileWriterEvent& event) noexcept
     {
@@ -217,13 +239,29 @@ private:
             assert(m_queue[m_head].has_value());
             assert(m_active_file != nullptr);
             const uint64_t sequence{m_queue[m_head]->sequence};
-            std::string line{std::move(m_queue[m_head]->line)};
+            Operation operation{std::move(m_queue[m_head]->operation)};
             FILE* const file{m_active_file};
+            FILE* replacement_file{nullptr};
+            AsyncFileWriterOperationKind operation_kind;
+            if (const auto* reopen{std::get_if<ReopenFile>(&operation)}) {
+                replacement_file = reopen->replacement;
+                assert(replacement_file != nullptr);
+                assert(file != replacement_file);
+                m_active_file = replacement_file;
+                operation_kind = AsyncFileWriterOperationKind::ReopenFile;
+            } else {
+                assert(std::holds_alternative<WriteLine>(operation));
+                operation_kind = AsyncFileWriterOperationKind::WriteLine;
+            }
             lock.unlock();
 
-            InvokeHook({AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, sequence, file});
-            fwrite(line.data(), 1, line.size(), file);
-            InvokeHook({AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, sequence, file});
+            InvokeHook({AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, sequence, operation_kind, file, replacement_file});
+            if (const auto* write{std::get_if<WriteLine>(&operation)}) {
+                fwrite(write->line.data(), 1, write->line.size(), file);
+            } else {
+                fclose(file);
+            }
+            InvokeHook({AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock, sequence, operation_kind, file, replacement_file});
 
             lock.lock();
             assert(m_queue[m_head].has_value());
@@ -278,6 +316,11 @@ void AsyncFileWriter::Start(FILE* file)
 EnqueueResult AsyncFileWriter::Write(std::string line)
 {
     return m_impl->Write(std::move(line));
+}
+
+EnqueueResult AsyncFileWriter::Reopen(FILE* replacement)
+{
+    return m_impl->Reopen(replacement);
 }
 
 void AsyncFileWriter::Flush()
