@@ -76,10 +76,18 @@ enum class AsyncFileWriterEventKind {
     ProducerFullPredicateFalseLockHeld,
 };
 
+enum class AsyncFileWriterOperationKind {
+    None,
+    WriteLine,
+    ReopenFile,
+};
+
 struct AsyncFileWriterEvent {
     AsyncFileWriterEventKind kind;
     uint64_t sequence{0};
+    AsyncFileWriterOperationKind operation_kind{AsyncFileWriterOperationKind::None};
     FILE* file{nullptr};
+    FILE* replacement_file{nullptr};
 };
 
 class AsyncFileWriterTestHooks {
@@ -105,6 +113,16 @@ public:
 
     void Start(FILE* file);
     EnqueueResult Write(std::string line);
+    /**
+     * replacement must be non-null, open, and unbuffered. Queued means the
+     * worker activates it at its FIFO sequence point and closes the old active
+     * stream. The caller may remember the latest accepted pointer but may not
+     * access or close worker-owned streams until Stop. A later queued Reopen
+     * closes this replacement in FIFO order. Stop leaves the final active
+     * stream open for the caller. Stopped leaves replacement untouched and
+     * entirely caller-owned.
+     */
+    EnqueueResult Reopen(FILE* replacement);
     void Flush();
     void Stop();
 
