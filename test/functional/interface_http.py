@@ -16,6 +16,7 @@ from test_framework.wallet import MiniWallet
 
 import concurrent.futures
 import http.client
+import json
 import socket
 import threading
 import time
@@ -676,10 +677,20 @@ class HTTPBasicsTest (BitcoinTestFramework):
                     conn.post('/', f'{{"method": "invalidrpc_{i}"}}', connection_header='keep-alive').read()
                     connections.append(conn)
 
+            def flush_log():
+                # Keep the connection count unchanged while draining the async
+                # writer: the framework's RPC proxy is deliberately closed.
+                response = connections[0].post(
+                    '/', '{"jsonrpc":"2.0","id":1,"method":"flushdebuglog"}',
+                    connection_header='keep-alive')
+                assert_equal(response.status, http.client.OK)
+                assert_equal(json.loads(response.read()), {"jsonrpc": "2.0", "id": 1, "result": None})
+
             # The next connection is over the limit, expect it to timeout
             with self.node.assert_debug_log(
                 expected_msgs = [],
-                unexpected_msgs = ["method=never_accepted"]
+                unexpected_msgs = ["method=never_accepted"],
+                flush = flush_log,
             ):
                 conn = BitcoinHTTPConnection(self.node)
                 conn.set_timeout(5)
