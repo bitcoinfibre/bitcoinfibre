@@ -384,9 +384,13 @@ class InitTest(BitcoinTestFramework):
             unexpected_msgs = ["Initialized HTTP server"],
             timeout = 10
         ):
-            node.start(extra_args=[f"-rpcmaxconnections={2**64}", "-server=0"])
-        # No HTTP server, no RPC `stop`
-        node.kill_process()
+            start_kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if platform.system() == "Windows" else {}
+            # No HTTP server: wait for startup, then drain the log through an
+            # orderly shutdown before asserting that no HTTP startup was logged.
+            with node.assert_debug_log(["net thread start"], timeout=10):
+                node.start(extra_args=[f"-rpcmaxconnections={2**64}", "-server=0"], **start_kwargs)
+            node.process.send_signal(signal.CTRL_BREAK_EVENT if platform.system() == "Windows" else signal.SIGTERM)
+            node.wait_until_stopped()
 
         if self.RLIM_INFINITY is not None:
             # Get the platform's file descriptor limit, if possible

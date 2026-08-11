@@ -7,6 +7,7 @@
 #define BITCOIN_LOGGING_H
 
 #include <crypto/siphash.h>
+#include <logging/async_file_writer.h>
 #include <logging/categories.h> // IWYU pragma: export
 #include <span.h>
 #include <util/byte_units.h>
@@ -132,7 +133,13 @@ namespace BCLog {
     private:
         mutable StdMutex m_cs; // Can not use Mutex from sync.h because in debug mode it would cause a deadlock when a potential deadlock was detected
 
+        // While the writer is Running or Draining, only its worker may perform
+        // file I/O or close active/superseded streams. Logger may remember the
+        // latest successfully accepted stream in m_fileout, but may not access
+        // or close it asynchronously. After Stop returns, m_fileout is the sole
+        // Logger pointer authorized for synchronous fallback or final close.
         FILE* m_fileout GUARDED_BY(m_cs) = nullptr;
+        AsyncFileWriter m_file_writer;
         std::list<util::log::Entry> m_msgs_before_open GUARDED_BY(m_cs);
         bool m_buffering GUARDED_BY(m_cs) = true; //!< Buffer messages before logging can be started.
         size_t m_max_buffer_memusage GUARDED_BY(m_cs){DEFAULT_MAX_LOG_BUFFER};
@@ -161,6 +168,8 @@ namespace BCLog {
 
         /** Send an entry to the log output (internal) */
         void LogPrint_(util::log::Entry log_entry) EXCLUSIVE_LOCKS_REQUIRED(m_cs);
+
+        int WriteToFile(std::string_view str) EXCLUSIVE_LOCKS_REQUIRED(m_cs);
 
         std::string GetLogPrefix(LogFlags category, Level level) const;
 
@@ -210,6 +219,9 @@ namespace BCLog {
 
         /** Start logging (and flush all buffered messages) */
         bool StartLogging() EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+        void FlushFileWriterForTesting() EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+        /** Acquires no Logger mutex, so it is also safe while m_cs is held. */
+        void StopFileWriter();
         /** Only for testing */
         void DisconnectTestLogger() EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
 
@@ -282,5 +294,7 @@ namespace BCLog {
 } // namespace BCLog
 
 BCLog::Logger& LogInstance();
+
+void StopDebugLogFlushThread();
 
 #endif // BITCOIN_LOGGING_H
