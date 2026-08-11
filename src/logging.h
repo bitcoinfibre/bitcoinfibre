@@ -7,6 +7,7 @@
 #define BITCOIN_LOGGING_H
 
 #include <crypto/siphash.h>
+#include <logging/async_file_writer.h>
 #include <threadsafety.h>
 #include <tinyformat.h>
 #include <util/fs.h>
@@ -186,7 +187,13 @@ namespace BCLog {
     private:
         mutable StdMutex m_cs; // Can not use Mutex from sync.h because in debug mode it would cause a deadlock when a potential deadlock was detected
 
+        // While the writer is Running or Draining, only its worker may perform
+        // file I/O or close active/superseded streams. Logger may remember the
+        // latest successfully accepted stream in m_fileout, but may not access
+        // or close it asynchronously. After Stop returns, m_fileout is the sole
+        // Logger pointer authorized for synchronous fallback or final close.
         FILE* m_fileout GUARDED_BY(m_cs) = nullptr;
+        AsyncFileWriter m_file_writer;
         std::list<BufferedLog> m_msgs_before_open GUARDED_BY(m_cs);
         bool m_buffering GUARDED_BY(m_cs) = true; //!< Buffer messages before logging can be started.
         size_t m_max_buffer_memusage GUARDED_BY(m_cs){DEFAULT_MAX_LOG_BUFFER};
@@ -216,6 +223,8 @@ namespace BCLog {
         /** Send a string to the log output (internal) */
         void LogPrintStr_(std::string_view str, std::source_location&& source_loc, BCLog::LogFlags category, BCLog::Level level, bool should_ratelimit)
             EXCLUSIVE_LOCKS_REQUIRED(m_cs);
+
+        int WriteToFile(std::string_view str) EXCLUSIVE_LOCKS_REQUIRED(m_cs);
 
         std::string GetLogPrefix(LogFlags category, Level level) const;
 
@@ -260,6 +269,9 @@ namespace BCLog {
 
         /** Start logging (and flush all buffered messages) */
         bool StartLogging() EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+        void FlushFileWriterForTesting() EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+        /** Acquires no Logger mutex, so it is also safe while m_cs is held. */
+        void StopFileWriter();
         /** Only for testing */
         void DisconnectTestLogger() EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
 
@@ -382,5 +394,7 @@ inline void LogPrintFormatInternal(std::source_location&& source_loc, BCLog::Log
 // Log conditionally, prefixing the output with the passed category name.
 #define LogDebug(category, ...) LogPrintLevel(category, BCLog::Level::Debug, __VA_ARGS__)
 #define LogTrace(category, ...) LogPrintLevel(category, BCLog::Level::Trace, __VA_ARGS__)
+
+void StopDebugLogFlushThread();
 
 #endif // BITCOIN_LOGGING_H

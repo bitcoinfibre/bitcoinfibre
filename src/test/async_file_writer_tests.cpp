@@ -10,6 +10,7 @@
 
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <future>
 #include <functional>
 #include <latch>
+#include <optional>
 #include <semaphore>
 #include <string>
 #include <string_view>
@@ -169,6 +171,41 @@ private:
 std::string NumberedLine(std::string_view prefix, size_t number)
 {
     return std::string{prefix} + std::to_string(number) + "\n";
+}
+
+struct ProducerOrdinal {
+    size_t producer;
+    size_t ordinal;
+};
+
+std::string ProducerLine(size_t producer, size_t ordinal)
+{
+    return "producer=" + std::to_string(producer) + ";ordinal=" + std::to_string(ordinal) + "\n";
+}
+
+std::optional<ProducerOrdinal> ParseProducerLine(std::string_view line)
+{
+    constexpr std::string_view PRODUCER_PREFIX{"producer="};
+    constexpr std::string_view ORDINAL_PREFIX{"ordinal="};
+    if (!line.ends_with('\n')) return std::nullopt;
+    line.remove_suffix(1);
+    if (!line.starts_with(PRODUCER_PREFIX)) return std::nullopt;
+    line.remove_prefix(PRODUCER_PREFIX.size());
+
+    const size_t separator{line.find(';')};
+    if (separator == std::string_view::npos) return std::nullopt;
+    const std::string_view producer_text{line.substr(0, separator)};
+    line.remove_prefix(separator + 1);
+    if (!line.starts_with(ORDINAL_PREFIX)) return std::nullopt;
+    line.remove_prefix(ORDINAL_PREFIX.size());
+    if (producer_text.empty() || line.empty()) return std::nullopt;
+
+    ProducerOrdinal result{};
+    const auto [producer_end, producer_error]{std::from_chars(producer_text.begin(), producer_text.end(), result.producer)};
+    if (producer_error != std::errc{} || producer_end != producer_text.end()) return std::nullopt;
+    const auto [ordinal_end, ordinal_error]{std::from_chars(line.begin(), line.end(), result.ordinal)};
+    if (ordinal_error != std::errc{} || ordinal_end != line.end()) return std::nullopt;
+    return result;
 }
 
 void RequireQueued(BCLog::AsyncFileWriter& writer, const std::string& line)
@@ -1782,6 +1819,130 @@ BOOST_AUTO_TEST_CASE(multiple_reopens_preserve_fifo_and_close_order)
     }
     for (size_t index{8}; index < operation_events.size(); ++index) {
         BOOST_CHECK(operation_events[index].file != file_b.Get());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(concurrent_producers_preserve_per_producer_order)
+{
+    constexpr size_t PRODUCER_COUNT{4};
+    constexpr size_t OPERATIONS_PER_PRODUCER{64};
+    std::latch producers_ready{PRODUCER_COUNT};
+    Gate producers_release{0};
+    std::vector<std::future<bool>> producers;
+    producers.reserve(PRODUCER_COUNT);
+
+    WriterTestContext context{
+        m_path_root,
+        [](const AsyncFileWriterEvent&) noexcept {},
+        [&] { producers_release.release(RELEASE_ALL_COUNT); },
+        [&] {
+            for (auto& producer : producers) {
+                if (producer.valid()) producer.wait();
+            }
+        }};
+
+    context.Start();
+    for (size_t producer{0}; producer < PRODUCER_COUNT; ++producer) {
+        producers.emplace_back(std::async(std::launch::async, [&context, &producers_ready, &producers_release, producer] {
+            producers_ready.count_down();
+            producers_release.acquire();
+            for (size_t ordinal{0}; ordinal < OPERATIONS_PER_PRODUCER; ++ordinal) {
+                if (context.writer.Write(ProducerLine(producer, ordinal)) != EnqueueResult::Queued) return false;
+            }
+            return true;
+        }));
+    }
+    producers_ready.wait();
+    for (auto& producer : producers) {
+        CheckNotReady(producer);
+    }
+    producers_release.release(PRODUCER_COUNT);
+    for (auto& producer : producers) {
+        RequireReady(producer);
+        BOOST_REQUIRE(producer.get());
+    }
+
+    context.writer.Flush();
+    context.writer.Stop();
+    const std::string output{context.file.Read()};
+    std::array<std::array<unsigned int, OPERATIONS_PER_PRODUCER>, PRODUCER_COUNT> seen{};
+    std::array<size_t, PRODUCER_COUNT> next_ordinal{};
+    size_t line_count{0};
+    size_t offset{0};
+    while (offset < output.size()) {
+        const size_t newline{output.find('\n', offset)};
+        BOOST_REQUIRE(newline != std::string::npos);
+        const auto parsed{ParseProducerLine(std::string_view{output}.substr(offset, newline - offset + 1))};
+        BOOST_REQUIRE(parsed.has_value());
+        BOOST_REQUIRE(parsed->producer < PRODUCER_COUNT);
+        BOOST_REQUIRE(parsed->ordinal < OPERATIONS_PER_PRODUCER);
+        BOOST_CHECK_EQUAL(parsed->ordinal, next_ordinal[parsed->producer]);
+        ++next_ordinal[parsed->producer];
+        BOOST_CHECK_EQUAL(seen[parsed->producer][parsed->ordinal], 0U);
+        ++seen[parsed->producer][parsed->ordinal];
+        ++line_count;
+        offset = newline + 1;
+    }
+
+    BOOST_CHECK_EQUAL(line_count, PRODUCER_COUNT * OPERATIONS_PER_PRODUCER);
+    for (size_t producer{0}; producer < PRODUCER_COUNT; ++producer) {
+        BOOST_CHECK_EQUAL(next_ordinal[producer], OPERATIONS_PER_PRODUCER);
+        for (size_t ordinal{0}; ordinal < OPERATIONS_PER_PRODUCER; ++ordinal) {
+            BOOST_CHECK_EQUAL(seen[producer][ordinal], 1U);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(large_and_empty_payloads_preserve_exact_bytes)
+{
+    std::array<OperationObservation, 8> operation_events{};
+    std::atomic<size_t> operation_event_count{0};
+    WriterTestContext context{
+        m_path_root,
+        [&](const AsyncFileWriterEvent& event) noexcept {
+            if (event.kind == AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld ||
+                event.kind == AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock) {
+                const size_t index{operation_event_count.fetch_add(1)};
+                if (index < operation_events.size()) {
+                    operation_events[index] = {
+                        event.kind,
+                        event.sequence,
+                        event.operation_kind,
+                        event.file,
+                        event.replacement_file,
+                    };
+                }
+            }
+        }};
+
+    const std::string prefix{"payload-prefix\n"};
+    std::string large(256 * 1024, '\0');
+    for (size_t index{0}; index < large.size(); ++index) {
+        large[index] = static_cast<char>('a' + index % 26);
+    }
+    const std::string suffix{"\npayload-suffix\n"};
+
+    context.Start();
+    BOOST_REQUIRE(context.writer.Write(prefix) == EnqueueResult::Queued);
+    BOOST_REQUIRE(context.writer.Write("") == EnqueueResult::Queued);
+    BOOST_REQUIRE(context.writer.Write(large) == EnqueueResult::Queued);
+    BOOST_REQUIRE(context.writer.Write(suffix) == EnqueueResult::Queued);
+    context.writer.Flush();
+    context.writer.Stop();
+
+    BOOST_CHECK_EQUAL(context.file.Read(), prefix + large + suffix);
+    BOOST_REQUIRE_EQUAL(operation_event_count.load(), operation_events.size());
+    for (size_t index{0}; index < operation_events.size(); ++index) {
+        const OperationObservation& event{operation_events[index]};
+        const AsyncFileWriterEventKind expected_kind{
+            index % 2 == 0
+                ? AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld
+                : AsyncFileWriterEventKind::WorkerAfterFileOperationBeforeCompletionLock};
+        BOOST_CHECK(event.event_kind == expected_kind);
+        BOOST_CHECK_EQUAL(event.sequence, index / 2 + 1);
+        BOOST_CHECK(event.operation_kind == AsyncFileWriterOperationKind::WriteLine);
+        BOOST_CHECK(event.file == context.file.Get());
+        BOOST_CHECK(event.replacement_file == nullptr);
     }
 }
 
