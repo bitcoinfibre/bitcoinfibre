@@ -382,9 +382,11 @@ class InitTest(BitcoinTestFramework):
             unexpected_msgs = ["Initialized HTTP server"],
             timeout = 10
         ):
-            node.start(extra_args=[f"-rpcmaxconnections={2**64}", "-server=0"], **get_process_group_kwargs())
-        # No HTTP server, no RPC `stop`
-        sigterm_node(node)
+            # No HTTP server: wait for startup, then drain the log through an
+            # orderly shutdown before asserting that no HTTP startup was logged.
+            with node.assert_debug_log(["net thread start"], timeout=10):
+                node.start(extra_args=[f"-rpcmaxconnections={2**64}", "-server=0"], **get_process_group_kwargs())
+            sigterm_node(node)
 
         # From net.h
         MAX_PEER_CONNECTIONS = 2000

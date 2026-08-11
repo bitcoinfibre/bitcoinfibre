@@ -283,6 +283,22 @@ static RPCMethod logging()
     };
 }
 
+static RPCMethod flushdebuglog()
+{
+    return RPCMethod{
+        "flushdebuglog",
+        "Wait for all debug log entries accepted before this call to be written.\n"
+        "This command is for testing.\n",
+        {},
+        RPCResult{RPCResult::Type::NONE, "", ""},
+        RPCExamples{""},
+        [](const RPCMethod&, const JSONRPCRequest&) -> UniValue {
+            LogInstance().FlushFileWriterForTesting();
+            return UniValue::VNULL;
+        },
+    };
+}
+
 static RPCMethod echo(const std::string& name)
 {
     return RPCMethod{
@@ -426,6 +442,7 @@ void RegisterNodeRPCCommands(CRPCTable& t)
         {"control", &getmemoryinfo},
         {"control", &logging},
         {"util", &getindexinfo},
+        {"hidden", &flushdebuglog},
         {"hidden", &setmocktime},
         {"hidden", &mockscheduler},
         {"hidden", &echo},

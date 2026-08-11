@@ -101,6 +101,10 @@ class AuthServiceProxy():
         self.__conn.request(method, path, postdata, headers)
         return self._get_response()
 
+    def _has_open_connection(self):
+        """Whether an auxiliary RPC can reuse the existing HTTP connection."""
+        return self.reuse_http_connections and self.__conn.sock is not None
+
     def _json_dumps(self, obj):
         return json.dumps(obj, default=serialization_fallback, ensure_ascii=self.ensure_ascii)
 

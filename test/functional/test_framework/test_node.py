@@ -16,6 +16,9 @@ import re
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
 import urllib.parse
 import collections
 import sys
@@ -608,21 +611,62 @@ class TestNode():
             dl.seek(0, 2)
             return dl.tell()
 
+    def _flush_debug_log(self, *, allow_cli=False):
+        # A stopped node cannot append any more entries. Only current nodes
+        # provide the hidden flush RPC. Never implicitly open an AuthServiceProxy
+        # connection: HTTP tests may deliberately occupy every available slot.
+        if not self.running:
+            return True
+        if not self.rpc_connected or self.version is not None:
+            return False
+        if self.use_cli:
+            if not allow_cli:
+                return False
+        elif self._rpc is None or not self._rpc._has_open_connection():
+            return False
+        self.flushdebuglog()
+        return True
+
     @contextlib.contextmanager
-    def assert_debug_log(self, expected_msgs, unexpected_msgs=None, *, timeout=0):
+    def assert_debug_log(self, expected_msgs, unexpected_msgs=None, *, timeout=2, flush=None):
+        """Check messages after the context's initial log position.
+
+        Negative checks flush after the body and after observing expected messages,
+        then reread the file. Callers must still synchronize the work producing logs
+        in the body; flushing does not wait for future node activity. The timeout
+        bounds waiting for expected messages, not a negative observation window.
+
+        An optional flush callback establishes the same boundary using a caller-owned
+        transport (for example an existing HTTP connection). Otherwise use the open
+        RPC proxy, or the configured CLI for negative checks. Without a flush or a
+        stopped node, negative checks fail instead of silently accepting queued logs.
+        """
         if unexpected_msgs is None:
             unexpected_msgs = []
         assert_equal(type(expected_msgs), list)
         assert_equal(type(unexpected_msgs), list)
         remaining_expected = list(expected_msgs)
 
-        time_end = time.time() + timeout * self.timeout_factor
+        def flush_log(*, required=False):
+            if flush is not None:
+                flush()
+            elif not self._flush_debug_log(allow_cli=bool(unexpected_msgs)) and required:
+                self._raise_assertion_error(
+                    "Cannot check unexpected log messages without a log flush boundary; "
+                    "supply flush= using an existing transport or stop the node first")
+
+        flush_log()
         prev_size = self.debug_log_size(encoding="utf-8")  # Must use same encoding that is used to read() below
 
         def join_log(log):
             return " - " + "\n - ".join(log.splitlines())
 
         yield
+        time_end = time.monotonic() + timeout * self.timeout_factor
+
+        if unexpected_msgs:
+            flush_log(required=True)
+        final_check = not expected_msgs
 
         while True:
             with open(self.debug_log_path, encoding="utf-8", errors="replace") as dl:
@@ -635,8 +679,15 @@ class TestNode():
             while remaining_expected and remaining_expected[-1] in log:
                 remaining_expected.pop()
             if not remaining_expected:
+                if unexpected_msgs and not final_check:
+                    # An expected message may have arrived during polling, after
+                    # the first flush. Drain entries queued behind it before the
+                    # final read; seeing the expected line is not that boundary.
+                    flush_log(required=True)
+                    final_check = True
+                    continue
                 return
-            if time.time() >= time_end:
+            if time.monotonic() >= time_end:
                 break
             time.sleep(0.05)
         remaining_expected = [e for e in remaining_expected if e not in log]
@@ -892,6 +943,164 @@ class TestNode():
 
     def wait_until(self, test_function, timeout=60, check_interval=0.05):
         return wait_until_helper_internal(test_function, timeout=timeout, timeout_factor=self.timeout_factor, check_interval=check_interval)
+
+
+class _AssertDebugLogTestNode(TestNode):
+    def __init__(self, datadir_path):
+        self.index = 0
+        self.datadir_path = datadir_path
+        self.chain = "regtest"
+        self.timeout_factor = 1
+        self.running = True
+        self.rpc_connected = True
+        self.version = None
+        self.use_cli = False
+        self._rpc = SimpleNamespace(_has_open_connection=lambda: True)
+        self.process = None
+        self.ipc_tmp_dir = None
+        self.events = []
+        self.pending_log = ["pre-entry-marker\n"]
+
+        self.chain_path.mkdir()
+        self.debug_log_path.write_text("", encoding="utf-8")
+
+    def flushdebuglog(self):
+        self.events.append("flush")
+        with open(self.debug_log_path, "a", encoding="utf-8") as debug_log:
+            debug_log.writelines(self.pending_log)
+        self.pending_log.clear()
+
+    def debug_log_size(self, **kwargs):
+        self.events.append("size")
+        return super().debug_log_size(**kwargs)
+
+
+class TestNodeAssertDebugLog(unittest.TestCase):
+    def test_flush_precedes_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            with node.assert_debug_log(["body-marker"], unexpected_msgs=["pre-entry-marker"], timeout=0):
+                with open(node.debug_log_path, "a", encoding="utf-8") as debug_log:
+                    debug_log.write("body-marker\n")
+
+            self.assertEqual(node.events, ["flush", "size", "flush", "flush"])
+
+    def test_pre_entry_message_cannot_satisfy_expectation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            with self.assertRaisesRegex(AssertionError, "Expected message"):
+                with node.assert_debug_log(["pre-entry-marker"], timeout=0):
+                    pass
+
+            self.assertEqual(node.events, ["flush", "size"])
+
+    def test_flush_requires_current_connected_node(self):
+        cases = [
+            {"running": False},
+            {"rpc_connected": False},
+            {"version": 280000},
+            {"use_cli": True},
+            {"_rpc": None},
+            {"_rpc": SimpleNamespace(_has_open_connection=lambda: False)},
+        ]
+        for attributes in cases:
+            with self.subTest(**attributes), tempfile.TemporaryDirectory() as tmpdir:
+                node = _AssertDebugLogTestNode(Path(tmpdir))
+                for name, value in attributes.items():
+                    setattr(node, name, value)
+                with node.assert_debug_log(["body-marker"], timeout=0):
+                    with open(node.debug_log_path, "a", encoding="utf-8") as debug_log:
+                        debug_log.write("body-marker\n")
+
+                self.assertEqual(node.events, ["size"])
+
+    def test_negative_only_rejects_pending_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            with self.assertRaisesRegex(AssertionError, 'Unexpected message "forbidden"'):
+                with node.assert_debug_log([], unexpected_msgs=["forbidden"], timeout=0):
+                    node.pending_log.append("forbidden\n")
+
+    def test_expected_message_does_not_hide_pending_unexpected_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            with self.assertRaisesRegex(AssertionError, 'Unexpected message "forbidden"'):
+                with node.assert_debug_log(["expected"], unexpected_msgs=["forbidden"], timeout=0):
+                    with node.debug_log_path.open("a", encoding="utf-8") as log:
+                        log.write("expected\n")
+                    node.pending_log.append("forbidden\n")
+
+    def test_flush_after_expected_message_arrives_while_polling(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+
+            def writer_progress(_seconds):
+                with node.debug_log_path.open("a", encoding="utf-8") as log:
+                    log.write("expected\n")
+                node.pending_log.append("forbidden\n")
+
+            with patch(__name__ + ".time.sleep", side_effect=writer_progress):
+                with self.assertRaisesRegex(AssertionError, 'Unexpected message "forbidden"'):
+                    with node.assert_debug_log(["expected"], unexpected_msgs=["forbidden"]):
+                        pass
+
+    def test_negative_check_requires_a_flush_boundary(self):
+        cases = [
+            {"rpc_connected": False},
+            {"version": 280000},
+            {"_rpc": None},
+            {"_rpc": SimpleNamespace(_has_open_connection=lambda: False)},
+        ]
+        for attributes in cases:
+            with self.subTest(**attributes), tempfile.TemporaryDirectory() as tmpdir:
+                node = _AssertDebugLogTestNode(Path(tmpdir))
+                for name, value in attributes.items():
+                    setattr(node, name, value)
+                with self.assertRaisesRegex(AssertionError, "Cannot check unexpected log messages"):
+                    with node.assert_debug_log([], unexpected_msgs=["forbidden"], timeout=0):
+                        node.pending_log.append("forbidden\n")
+                self.assertEqual(node.events, ["size"])
+
+    def test_negative_check_with_explicit_flush(self):
+        for forbidden in (False, True):
+            with self.subTest(forbidden=forbidden), tempfile.TemporaryDirectory() as tmpdir:
+                node = _AssertDebugLogTestNode(Path(tmpdir))
+                node._rpc = SimpleNamespace(_has_open_connection=lambda: False)
+                error = self.assertRaisesRegex(AssertionError, 'Unexpected message "forbidden"') if forbidden else contextlib.nullcontext()
+                with error:
+                    with node.assert_debug_log([], unexpected_msgs=["forbidden"], timeout=0, flush=node.flushdebuglog):
+                        node.pending_log.append("forbidden\n" if forbidden else "allowed\n")
+                self.assertEqual(node.pending_log, [])
+                self.assertEqual(node.events, ["flush", "size", "flush"])
+
+    def test_negative_check_uses_cli_flush(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            node.use_cli = True
+            node._rpc = None
+            with self.assertRaisesRegex(AssertionError, 'Unexpected message "forbidden"'):
+                with node.assert_debug_log([], unexpected_msgs=["forbidden"], timeout=0):
+                    node.pending_log.append("forbidden\n")
+            self.assertEqual(node.pending_log, [])
+
+    def test_negative_check_after_node_stop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            with node.assert_debug_log([], unexpected_msgs=["forbidden"], timeout=0):
+                node.pending_log.append("shutdown\n")
+                node.flushdebuglog()  # Model the writer draining on shutdown.
+                node.running = False
+            self.assertEqual(node.events, ["flush", "size", "flush"])
+
+    def test_failed_flush_is_not_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            with self.assertRaisesRegex(RuntimeError, "flush failed"):
+                with node.assert_debug_log([], unexpected_msgs=["forbidden"], timeout=0):
+                    def fail():
+                        raise RuntimeError("flush failed")
+                    node.flushdebuglog = fail
+
 
 class TestNodeCLIAttr:
     def __init__(self, cli, command):
