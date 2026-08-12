@@ -17,6 +17,7 @@ import re
 import subprocess
 import tempfile
 import time
+import unittest
 import urllib.parse
 import collections
 import shlex
@@ -45,7 +46,7 @@ from .util import (
     tor_port,
 )
 
-BITCOIND_PROC_WAIT_TIMEOUT = 600 # Increased from 60 to 600 due to log ring buffer
+BITCOIND_PROC_WAIT_TIMEOUT = 60
 # The size of the blocks xor key
 # from InitBlocksdirXorKey::xor_key.size()
 NUM_XOR_BYTES = 8
@@ -572,21 +573,28 @@ class TestNode():
             dl.seek(0, 2)
             return dl.tell()
 
+    def _flush_debug_log(self):
+        # Only current nodes provide this hidden RPC. A stopped node has
+        # already drained its writer.
+        if self.running and self.rpc_connected and self.version is None:
+            self.flushdebuglog()
+
     @contextlib.contextmanager
-    def assert_debug_log(self, expected_msgs, unexpected_msgs=None, *, timeout=0):
+    def assert_debug_log(self, expected_msgs, unexpected_msgs=None, *, timeout=2):
         if unexpected_msgs is None:
             unexpected_msgs = []
         assert_equal(type(expected_msgs), list)
         assert_equal(type(unexpected_msgs), list)
         remaining_expected = list(expected_msgs)
 
-        time_end = time.time() + timeout * self.timeout_factor
+        self._flush_debug_log()
         prev_size = self.debug_log_size(encoding="utf-8")  # Must use same encoding that is used to read() below
 
         def join_log(log):
             return " - " + "\n - ".join(log.splitlines())
 
         yield
+        time_end = time.monotonic() + timeout * self.timeout_factor
 
         while True:
             with open(self.debug_log_path, encoding="utf-8", errors="replace") as dl:
@@ -600,7 +608,7 @@ class TestNode():
                 remaining_expected.pop()
             if not remaining_expected:
                 return
-            if time.time() >= time_end:
+            if time.monotonic() >= time_end:
                 break
             time.sleep(0.05)
         remaining_expected = [e for e in remaining_expected if e not in log]
@@ -929,6 +937,70 @@ class TestNode():
 
     def wait_until(self, test_function, timeout=60, check_interval=0.05):
         return wait_until_helper_internal(test_function, timeout=timeout, timeout_factor=self.timeout_factor, check_interval=check_interval)
+
+
+class _AssertDebugLogTestNode(TestNode):
+    def __init__(self, datadir_path):
+        self.index = 0
+        self.datadir_path = datadir_path
+        self.chain = "regtest"
+        self.timeout_factor = 1
+        self.running = True
+        self.rpc_connected = True
+        self.version = None
+        self.process = None
+        self.ipc_tmp_dir = None
+        self.events = []
+
+        self.chain_path.mkdir()
+        self.debug_log_path.write_text("", encoding="utf-8")
+
+    def flushdebuglog(self):
+        self.events.append("flush")
+        with open(self.debug_log_path, "a", encoding="utf-8") as debug_log:
+            debug_log.write("pre-entry-marker\n")
+
+    def debug_log_size(self, **kwargs):
+        self.events.append("size")
+        return super().debug_log_size(**kwargs)
+
+
+class TestNodeAssertDebugLog(unittest.TestCase):
+    def test_flush_precedes_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            with node.assert_debug_log(["body-marker"], unexpected_msgs=["pre-entry-marker"], timeout=0):
+                with open(node.debug_log_path, "a", encoding="utf-8") as debug_log:
+                    debug_log.write("body-marker\n")
+
+            self.assertEqual(node.events, ["flush", "size"])
+
+    def test_pre_entry_message_cannot_satisfy_expectation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node = _AssertDebugLogTestNode(Path(tmpdir))
+            with self.assertRaisesRegex(AssertionError, "Expected message"):
+                with node.assert_debug_log(["pre-entry-marker"], timeout=0):
+                    pass
+
+            self.assertEqual(node.events, ["flush", "size"])
+
+    def test_flush_requires_current_connected_node(self):
+        cases = [
+            {"running": False},
+            {"rpc_connected": False},
+            {"version": 280000},
+        ]
+        for attributes in cases:
+            with self.subTest(**attributes), tempfile.TemporaryDirectory() as tmpdir:
+                node = _AssertDebugLogTestNode(Path(tmpdir))
+                for name, value in attributes.items():
+                    setattr(node, name, value)
+                with node.assert_debug_log(["body-marker"], timeout=0):
+                    with open(node.debug_log_path, "a", encoding="utf-8") as debug_log:
+                        debug_log.write("body-marker\n")
+
+                self.assertEqual(node.events, ["size"])
+
 
 class TestNodeCLIAttr:
     def __init__(self, cli, command):
