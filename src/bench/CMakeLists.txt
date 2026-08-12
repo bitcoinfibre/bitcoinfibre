@@ -32,6 +32,7 @@ add_executable(bench_bitcoin
   load_external.cpp
   lockedpool.cpp
   logging.cpp
+  logging_async_file_writer.cpp
   mempool_ephemeral_spends.cpp
   mempool_eviction.cpp
   mempool_stress.cpp
