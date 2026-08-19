@@ -5,6 +5,7 @@
 #include <logging/async_file_writer.h>
 
 #include <util/threadnames.h>
+#include <util/trace.h>
 
 #include <array>
 #include <cassert>
@@ -18,6 +19,10 @@
 #include <thread>
 #include <utility>
 #include <variant>
+
+TRACEPOINT_SEMAPHORE(logging, async_file_queued);
+TRACEPOINT_SEMAPHORE(logging, async_file_operation_started);
+TRACEPOINT_SEMAPHORE(logging, async_file_operation_completed);
 
 namespace BCLog {
 
@@ -198,6 +203,7 @@ private:
         m_tail = (m_tail + 1) % MAX_PENDING_OPERATIONS;
         ++m_count;
         m_highest_accepted_sequence = sequence;
+        TRACEPOINT(logging, async_file_queued, sequence, static_cast<uint64_t>(m_count));
 
         lock.unlock();
         m_not_empty.notify_one();
@@ -256,6 +262,7 @@ private:
             lock.unlock();
 
             InvokeHook({AsyncFileWriterEventKind::WorkerBeforeFileOperationLockNotHeld, sequence, operation_kind, file, replacement_file});
+            TRACEPOINT(logging, async_file_operation_started, sequence, static_cast<uint32_t>(operation_kind));
             if (const auto* write{std::get_if<WriteLine>(&operation)}) {
                 fwrite(write->line.data(), 1, write->line.size(), file);
             } else {
@@ -270,6 +277,7 @@ private:
             m_head = (m_head + 1) % MAX_PENDING_OPERATIONS;
             --m_count;
             m_highest_completed_sequence = sequence;
+            TRACEPOINT(logging, async_file_operation_completed, sequence, static_cast<uint32_t>(operation_kind), static_cast<uint64_t>(m_count));
             InvokeHook({AsyncFileWriterEventKind::WorkerAfterSlotReleaseLockHeld, sequence});
             lock.unlock();
 
