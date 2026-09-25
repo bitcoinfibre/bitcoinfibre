@@ -75,3 +75,102 @@ class FibrePeer:
         nonce = b"fibre-v4"
         self.send(PING, nonce)
         assert_equal(self.receive(PONG), nonce)
+
+
+class FibreProtocolTest(BitcoinTestFramework):
+    def set_test_params(self):
+        self.num_nodes = 2
+        self.setup_clean_chain = True
+
+    def setup_network(self):
+        # Use the test's assigned TCP port numbers for UDP as well. There are
+        # deliberately no TCP peers: the relay check must use FIBRE.
+        self.extra_args = [[f"-udpport={p2p_port(i)},0", "-debug=udpnet"] for i in range(self.num_nodes)]
+        self.setup_nodes()
+
+    @contextmanager
+    def peer(self):
+        node = self.nodes[0]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.connect(("127.0.0.1", p2p_port(0)))
+            peer = FibrePeer(sock, timeout=10 * self.options.timeout_factor)
+            node.addudpnode(peer.address, LOCAL_SECRET, REMOTE_SECRET, False, "onetry")
+            try:
+                peer.check_syn()
+                yield peer
+            finally:
+                peer.send(DISCONNECT)
+                self.wait_until(lambda: all(info["addr"] != peer.address for info in node.getudppeerinfo()))
+
+    def test_protocol_identity(self):
+        self.log.info("Advertise and accept the protocol version used by origin/archive")
+        with self.peer() as peer:
+            peer.handshake()
+
+    def test_syn_field(self):
+        self.log.info("Ignore the upper 32 bits of the eight-byte SYN field")
+        for upper_bits in (1, 0x80000000, 0xffffffff):
+            with self.peer() as peer:
+                peer.handshake(version=(upper_bits << 32) | VERSION)
+
+        self.log.info("Enforce the SYN field width and the minimum version in its lower 32 bits")
+        incompatible_version = (5 << 16) | 5  # Requires a version newer than our current version 4.
+        for payload in (
+            VERSION.to_bytes(4, "little"),
+            VERSION.to_bytes(9, "little"),
+            incompatible_version.to_bytes(8, "little"),
+            ((0xffffffff << 32) | incompatible_version).to_bytes(8, "little"),
+        ):
+            with self.peer() as peer:
+                peer.send(SYN, payload)
+                assert_equal(peer.receive(DISCONNECT), b"")
+
+    def test_unsupported_transaction(self):
+        self.log.info("Disconnect peers that send the reserved transaction message type")
+        with self.peer() as peer:
+            peer.handshake()
+            # Match the legacy transaction packet size, so rejection cannot be
+            # attributed to an invalid packet length or incomplete handshake.
+            peer.send(TX_CONTENTS, bytes(1167))
+            assert_equal(peer.receive(DISCONNECT), b"")
+
+    def test_relay(self):
+        self.log.info("Relay blocks without the height prefix using only UDP")
+        node0, node1 = self.nodes
+        # Give both nodes a recent common tip and leave initial block download.
+        address = node0.get_deterministic_priv_key().address
+        tip = self.generatetoaddress(node0, 1, address, sync_fun=self.no_op)[0]
+        assert_equal(node1.submitblock(node0.getblock(tip, 0)), None)
+        for node in self.nodes:
+            assert not node.getblockchaininfo()["initialblockdownload"]
+            assert_equal(node.getpeerinfo(), [])
+
+        node0.addudpnode(f"127.0.0.1:{p2p_port(1)}", LOCAL_SECRET, REMOTE_SECRET, True, "add")
+        node1.addudpnode(f"127.0.0.1:{p2p_port(0)}", REMOTE_SECRET, LOCAL_SECRET, True, "onetry")
+
+        def connected():
+            return all(any(peer["lastrecv"] > 0 for peer in node.getudppeerinfo()) for node in self.nodes)
+
+        self.wait_until(connected)
+        tip = self.generatetoaddress(node0, 1, address, sync_fun=self.no_op)[0]
+        self.wait_until(lambda: node1.getbestblockhash() == tip)
+
+        self.log.info("Re-establish the FIBRE connection after a node restart")
+        self.restart_node(1)
+        node1.addudpnode(f"127.0.0.1:{p2p_port(0)}", REMOTE_SECRET, LOCAL_SECRET, True, "onetry")
+        self.wait_until(connected)
+        tip = self.generatetoaddress(node1, 1, address, sync_fun=self.no_op)[0]
+        self.wait_until(lambda: node0.getbestblockhash() == tip)
+        for node in self.nodes:
+            assert_equal(node.getpeerinfo(), [])
+
+    def run_test(self):
+        self.test_protocol_identity()
+        self.test_syn_field()
+        self.test_unsupported_transaction()
+        self.test_relay()
+
+
+if __name__ == "__main__":
+    FibreProtocolTest(__file__).main()
