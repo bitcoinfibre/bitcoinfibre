@@ -47,6 +47,10 @@ add_executable(test_bitcoin
   descriptor_tests.cpp
   disconnected_transactions.cpp
   fec_tests.cpp
+  fibre_peerman_tests.cpp
+  fibre_streams_tests.cpp
+  fibre_udp_tests.cpp
+  fibre_validation_tests.cpp
   fees_util_tests.cpp
   feefrac_tests.cpp
   feerounder_tests.cpp
