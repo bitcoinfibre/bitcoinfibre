@@ -24,7 +24,7 @@
 // Local stuff only uses magic, net stuff only uses protocol_version,
 // so both need to be changed any time wire format changes
 static const unsigned char LOCAL_MAGIC_BYTES[] = { 0xab, 0xad, 0xca, 0xfe };
-static const uint32_t UDP_PROTOCOL_VERSION = (4 << 16) | 4; // Min version 3, current version 3
+static const uint32_t UDP_PROTOCOL_VERSION = (4 << 16) | 4; // Min version 4, current version 4
 
 enum UDPMessageType {
     MSG_TYPE_SYN = 0,

@@ -165,15 +165,12 @@ private:
     // CBlockHeadersAnsShortTxIDs is used in the normal bitcoin peer protocol as
     // well, where transactions are not compressed.
     friend class PartiallyDownloadedChunkBlock;
-    int height = -1; // Block height - for OOOB storage of pre-BIP34 blocks
 public:
     CBlockHeaderAndLengthShortTxIDs(const CBlock& block, bool fDeterministic = false);
 
     // Dummy for deserialization
     CBlockHeaderAndLengthShortTxIDs() {}
 
-    int getBlockHeight() const { return height; };
-    void setBlockHeight(int h) { height = h; }
     size_t ShortTxIdCount() const { return shorttxids.size(); }
 
     // Fills a map from offset within a FEC-coded block to the tx index in the block
@@ -184,7 +181,6 @@ public:
     template <typename Stream>
     void Serialize(Stream& s) const
     {
-        s << height;
         s << AsBase<CBlockHeaderAndShortTxIDs>(*this);
         // NOTE: the lengths within the txlens vector are serialized directly
         // instead of serializing the vector using the VectorFormatter wrapper.
@@ -197,7 +193,6 @@ public:
     template <typename Stream>
     void Unserialize(Stream& s)
     {
-        s >> height;
         s >> AsBase<CBlockHeaderAndShortTxIDs>(*this);
         txlens.clear();
         txlens.reserve(shorttxids.size());

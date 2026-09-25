@@ -9,6 +9,7 @@
 #include <streams.h>
 #include <test/util/random.h>
 #include <test/util/txmempool.h>
+#include <util/strencodings.h>
 
 #include <test/util/common.h>
 #include <test/util/setup_common.h>
@@ -114,6 +115,93 @@ BOOST_AUTO_TEST_CASE(SimpleRoundTripTest)
         BOOST_CHECK_EQUAL(block.GetHash().ToString(), block3.GetHash().ToString());
         BOOST_CHECK_EQUAL(block.hashMerkleRoot.ToString(), BlockMerkleRoot(block3, &mutated).ToString());
         BOOST_CHECK(!mutated);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(FibreHeaderWireFormatTest)
+{
+    // Fixed FIBRE wire vectors: compact block (nonce 1), followed by one
+    // VARINT per short ID. There is no height prefix or length-vector count.
+    const std::string vectors[]{
+        "04030201010000000000000000000000000000000000000000000000000000000000000002000000"
+        "0000000000000000000000000000000000000000000000000000000008070605ffff001d0c0b0a09"
+        "01000000000000000001000200000001000000000000000000000000000000000000000000000000"
+        "0000000000000000ffffffff0a0000000000000000000000000000012a0000000000000000000000"
+        "00",
+        "04030201010000000000000000000000000000000000000000000000000000000000000002000000"
+        "0000000000000000000000000000000000000000000000000000000008070605ffff001d0c0b0a09"
+        "01000000000000000192e70d30ca9b01000200000001000000000000000000000000000000000000"
+        "0000000000000000000000000000ffffffff0a0000000000000000000000000000012a0000000000"
+        "00000000000000803e", // VARINT(190) = 0x803e
+    };
+
+    CBlock block;
+    block.nVersion = 0x01020304;
+    block.hashPrevBlock = uint256{1};
+    block.hashMerkleRoot = uint256{2};
+    block.nTime = 0x05060708;
+    block.nBits = 0x1d00ffff;
+    block.nNonce = 0x090a0b0c;
+    CMutableTransaction tx{BuildTransactionTestCase()};
+    tx.vin[0].nSequence = 0;
+    block.vtx.push_back(MakeTransactionRef(tx));
+
+    for (size_t i = 0; i < std::size(vectors); ++i) {
+        if (i != 0) {
+            tx.vin[0].prevout = COutPoint{Txid::FromUint256(uint256{3}), 0};
+            tx.vin[0].scriptSig.resize(130);
+            block.vtx.push_back(MakeTransactionRef(tx));
+        }
+        CBlockHeaderAndLengthShortTxIDs header{block, true};
+        std::vector<unsigned char> encoded;
+        VectorOutputStream{&encoded} << header;
+        BOOST_CHECK_EQUAL(HexStr(encoded), vectors[i]);
+
+        const auto expected{ParseHex(vectors[i])};
+        VectorInputStream stream{&expected};
+        CBlockHeaderAndLengthShortTxIDs decoded;
+        stream >> decoded;
+        BOOST_CHECK_EQUAL(stream.pos(), expected.size());
+        BOOST_CHECK(decoded.header.GetHash() == block.GetHash());
+        BOOST_CHECK_EQUAL(decoded.BlockTxCount(), block.vtx.size());
+        BOOST_CHECK_EQUAL(decoded.ShortTxIdCount(), i);
+
+        encoded.clear();
+        VectorOutputStream{&encoded} << decoded;
+        BOOST_CHECK_EQUAL(HexStr(encoded), vectors[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(FibreChunkRoundTripTest)
+{
+    auto rand_ctx{FastRandomContext{uint256{42}}};
+    for (const size_t tx_count : {1, 3}) {
+        CBlock block{BuildBlockTestCase(rand_ctx)};
+        block.vtx.resize(tx_count);
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const CBlockHeaderAndLengthShortTxIDs header{block, true};
+        const ChunkCodedBlock coded{block, header};
+        std::vector<unsigned char> encoded;
+        VectorOutputStream{&encoded} << header;
+        CBlockHeaderAndLengthShortTxIDs decoded;
+        VectorInputStream{&encoded} >> decoded;
+
+        PartiallyDownloadedChunkBlock partial{m_node.mempool.get()};
+        BOOST_REQUIRE(partial.InitData(decoded, empty_extra_txn) == READ_STATUS_OK);
+        if (tx_count > 1) {
+            BOOST_REQUIRE(partial.AreChunksAvailable());
+            BOOST_REQUIRE_EQUAL(partial.GetChunkCount() * FEC_CHUNK_SIZE, coded.GetCodedBlock().size());
+            for (size_t i = 0; i < partial.GetChunkCount(); ++i) {
+                std::copy_n(coded.GetCodedBlock().data() + i * FEC_CHUNK_SIZE, FEC_CHUNK_SIZE, partial.GetChunk(i));
+                partial.MarkChunkAvailable(i);
+            }
+        }
+        BOOST_REQUIRE(partial.IsBlockAvailable());
+        BOOST_REQUIRE(partial.FinalizeBlock() == READ_STATUS_OK);
+        DataStream original{}, reconstructed{};
+        original << TX_WITH_WITNESS(block);
+        reconstructed << TX_WITH_WITNESS(*partial.GetBlock());
+        BOOST_CHECK_EQUAL(HexStr(original), HexStr(reconstructed));
     }
 }
 
