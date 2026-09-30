@@ -5497,6 +5497,17 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
 
         CNodeState &state = *State(pto->GetId());
 
+        // Blocks can arrive through FIBRE or RPC without passing through the P2P
+        // receive handlers. Retire completed requests before checking for stalls
+        // or timeouts, using the existing lock rather than adding work to UDP.
+        for (auto it = state.vBlocksInFlight.begin(); it != state.vBlocksInFlight.end();) {
+            // Removing this hash also erases requests from other peers.
+            const CBlockIndex* pindex = (it++)->pindex;
+            if ((pindex->nStatus & BLOCK_HAVE_DATA) && pindex->IsValid(BLOCK_VALID_TRANSACTIONS)) {
+                RemoveBlockRequest(pindex->GetBlockHash(), std::nullopt);
+            }
+        }
+
         // Start block sync
         if (m_chainman.m_best_header == nullptr) {
             m_chainman.m_best_header = m_chainman.ActiveChain().Tip();
