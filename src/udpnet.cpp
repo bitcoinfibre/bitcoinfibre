@@ -414,7 +414,7 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg) {
             return;
         }
 
-        state.protocolVersion = le64toh(msg.msg.longint);
+        state.protocolVersion = static_cast<uint32_t>(le64toh(msg.msg.longint));
         if (PROTOCOL_VERSION_MIN(state.protocolVersion) > PROTOCOL_VERSION_CUR(UDP_PROTOCOL_VERSION)) {
             LogInfo("UDP: Got min protocol version we didnt understand (%u:%u) from %s\n", PROTOCOL_VERSION_MIN(state.protocolVersion), PROTOCOL_VERSION_CUR(state.protocolVersion), it->first.ToStringAddrPort());
             send_and_disconnect(it);
