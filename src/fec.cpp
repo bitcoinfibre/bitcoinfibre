@@ -67,6 +67,9 @@ FECDecoder& FECDecoder::operator=(FECDecoder&& decoder) {
     chunks_recvd      = decoder.chunks_recvd;
     decodeComplete    = decoder.decodeComplete;
     chunk_tracker     = std::move(decoder.chunk_tracker);
+    // Single-chunk messages keep their recovered bytes outside cm256_chunks.
+    if (chunk_count == 1 && decodeComplete)
+        memcpy(&tmp_chunk, &decoder.tmp_chunk, sizeof(tmp_chunk));
     if (CHUNK_COUNT_USES_CM256(decoder.chunk_count)) {
         void* orig_ptr = decoder.cm256_chunks.data();
         cm256_chunks  = std::move(decoder.cm256_chunks);
