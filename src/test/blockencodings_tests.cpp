@@ -6,6 +6,7 @@
 #include <fibre/streams.h>
 #include <chainparams.h>
 #include <consensus/merkle.h>
+#include <fec.h>
 #include <pow.h>
 #include <streams.h>
 #include <test/util/random.h>
@@ -205,6 +206,58 @@ BOOST_AUTO_TEST_CASE(FibreChunkRoundTripTest)
     }
 }
 
+BOOST_AUTO_TEST_CASE(FibreFecRecoveryTest)
+{
+    SeedRandomForTest(SeedRand::ZEROS);
+    auto rand_ctx{FastRandomContext{uint256{42}}};
+    for (const size_t count : {1, 2, CM256_MAX_CHUNKS, CM256_MAX_CHUNKS + 1, 64}) {
+        BOOST_TEST_CONTEXT("chunks=" << count) {
+            CBlock block{BuildBlockTestCase(rand_ctx)};
+            block.vtx.resize(2);
+            CMutableTransaction tx{*block.vtx[1]};
+            tx.vin[0].scriptSig.resize((count - 1) * FEC_CHUNK_SIZE);
+            block.vtx[1] = MakeTransactionRef(tx);
+            block.hashMerkleRoot = BlockMerkleRoot(block);
+            const CBlockHeaderAndLengthShortTxIDs header{block, true};
+            const ChunkCodedBlock coded{block, header};
+            const auto& data{coded.GetCodedBlock()};
+            BOOST_REQUIRE_EQUAL(data.size(), count * FEC_CHUNK_SIZE);
+
+            const size_t recovery_count{count + 32};
+            std::pair<std::unique_ptr<FECChunkType[]>, std::vector<uint32_t>> chunks{
+                std::make_unique<FECChunkType[]>(recovery_count), std::vector<uint32_t>(recovery_count)};
+            FECEncoder encoder{&data, &chunks};
+            BOOST_REQUIRE(encoder.PrefillChunks());
+            FECDecoder decoder{data.size()};
+            // Supply no originals, lose eight recovery packets, and deliver
+            // the remaining packets in reverse order with duplicates.
+            for (size_t i = recovery_count; i > 8 && !decoder.DecodeReady();) {
+                --i;
+                BOOST_CHECK_GE(chunks.second[i], count);
+                BOOST_REQUIRE(decoder.ProvideChunk(&chunks.first[i], chunks.second[i]));
+                const bool ready{decoder.DecodeReady()};
+                BOOST_REQUIRE(decoder.ProvideChunk(&chunks.first[i], chunks.second[i]));
+                BOOST_CHECK_EQUAL(decoder.DecodeReady(), ready);
+            }
+            BOOST_REQUIRE(decoder.DecodeReady());
+
+            PartiallyDownloadedChunkBlock partial{m_node.mempool.get()};
+            BOOST_REQUIRE(partial.InitData(header, empty_extra_txn) == READ_STATUS_OK);
+            BOOST_REQUIRE(partial.AreChunksAvailable());
+            BOOST_REQUIRE_EQUAL(partial.GetChunkCount(), count);
+            for (size_t i = 0; i < count; ++i) {
+                std::copy_n(static_cast<const unsigned char*>(decoder.GetDataPtr(i)), FEC_CHUNK_SIZE, partial.GetChunk(i));
+                partial.MarkChunkAvailable(i);
+            }
+            BOOST_REQUIRE(partial.IsBlockAvailable());
+            BOOST_REQUIRE(partial.FinalizeBlock() == READ_STATUS_OK);
+            DataStream original{}, reconstructed{};
+            original << TX_WITH_WITNESS(block);
+            reconstructed << TX_WITH_WITNESS(*partial.GetBlock());
+            BOOST_CHECK_EQUAL(HexStr(original), HexStr(reconstructed));
+        }
+    }
+}
 
 class TestHeaderAndShortIDs {
     // Utility to encode custom CBlockHeaderAndShortTxIDs
