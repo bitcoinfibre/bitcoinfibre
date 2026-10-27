@@ -203,7 +203,7 @@ inline std::string UDPLogPeer(const CService& peer)
 extern std::recursive_mutex cs_mapUDPNodes;
 extern std::map<CService, UDPConnectionState> mapUDPNodes;
 extern std::atomic<uint64_t> min_per_node_mbps; // Used to determine header FEC chunk count
-extern std::atomic_bool maybe_have_write_nodes;
+extern std::atomic_bool maybe_have_write_nodes; // Set when any peer is added; cleared only by StopUDPConnections
 
 void SendMessage(const UDPMessage& msg, const unsigned int length, bool high_prio, const CService& service, const uint64_t magic, size_t group);
 void SendMessage(const UDPMessage& msg, const unsigned int length, bool high_prio, const std::map<CService, UDPConnectionState>::const_iterator& node);

@@ -20,8 +20,6 @@ void StopUDPConnections();
 
 enum UDPConnectionType {
     UDP_CONNECTION_TYPE_NORMAL,
-    UDP_CONNECTION_TYPE_OUTBOUND_ONLY,
-    UDP_CONNECTION_TYPE_INBOUND_ONLY,
 };
 
 // fUltimatelyTrusted means you trust them (ie whitelist) and ALL OF THEIR SUBSEQUENT WHITELISTED PEERS
