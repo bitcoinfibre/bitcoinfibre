@@ -462,11 +462,6 @@ static void timer_func() {
     }
 
     for (std::map<CService, UDPConnectionState>::iterator it = mapUDPNodes.begin(); it != mapUDPNodes.end();) {
-        if (it->second.connection.connection_type != UDP_CONNECTION_TYPE_NORMAL) {
-            it++;
-            continue;
-        }
-
         UDPConnectionState& state = it->second;
 
         int64_t origLastSendTime = state.lastSendTime;
@@ -555,7 +550,6 @@ struct PerGroupMessageQueue {
     PerGroupMessageQueue(PerGroupMessageQueue&& q) = delete;
 };
 static std::vector<PerGroupMessageQueue> messageQueues;
-static const size_t LOCAL_RECEIVE_GROUP = (size_t)-1;
 
 static inline void SendMessage(const UDPMessage& msg, const unsigned int length, PendingMessagesBuff& buff, const CService& service, const uint64_t magic) {
     std::unique_lock<std::mutex> lock(send_messages_mutex);
@@ -580,10 +574,6 @@ static inline void SendMessage(const UDPMessage& msg, const unsigned int length,
 
 void SendMessage(const UDPMessage& msg, const unsigned int length, bool high_prio, const CService& service, const uint64_t magic, size_t group) {
     assert(length <= sizeof(UDPMessage));
-
-    if (group == LOCAL_RECEIVE_GROUP)
-        return;
-
     assert(group < messageQueues.size());
     PerGroupMessageQueue& queue = messageQueues[group];
     PendingMessagesBuff& buff = high_prio ? queue.buffs[0] : queue.buffs[1];
@@ -810,8 +800,7 @@ static void OpenUDPConnectionTo(const CService& addr, const UDPConnectionInfo& i
         res = mapUDPNodes.insert(std::make_pair(addr, UDPConnectionState()));
     }
 
-    if (info.connection_type != UDP_CONNECTION_TYPE_INBOUND_ONLY)
-        maybe_have_write_nodes = true;
+    maybe_have_write_nodes = true;
 
     LogDebug(BCLog::UDPNET, "UDP: Initializing connection to %s...\n", UDPLogPeer(addr));
 
@@ -833,16 +822,10 @@ static void OpenUDPConnectionTo(const CService& addr, const UDPConnectionInfo& i
 }
 
 void OpenUDPConnectionTo(const CService& addr, uint64_t local_magic, uint64_t remote_magic, bool fUltimatelyTrusted, UDPConnectionType connection_type, size_t group) {
-    if (connection_type == UDP_CONNECTION_TYPE_INBOUND_ONLY)
-        group = LOCAL_RECEIVE_GROUP;
-
     OpenUDPConnectionTo(addr, {htole64_internal(local_magic), htole64_internal(remote_magic), group, fUltimatelyTrusted, connection_type});
 }
 
 void OpenPersistentUDPConnectionTo(const CService& addr, uint64_t local_magic, uint64_t remote_magic, bool fUltimatelyTrusted, UDPConnectionType connection_type, size_t group) {
-    if (connection_type == UDP_CONNECTION_TYPE_INBOUND_ONLY)
-        group = LOCAL_RECEIVE_GROUP;
-
     std::unique_lock<std::recursive_mutex> lock(cs_mapUDPNodes);
 
     if (mapPersistentNodes.count(addr))
